@@ -22,6 +22,17 @@
 static struct ceetm_chnl_info qm_chnl_info[CDX_CEETM_MAX_CHANNELS];
 
 
+static int ceetm_runtime_tx_owner_supported(void)
+{
+#if defined(CONFIG_CPE_FAST_PATH) || defined(CONFIG_CPE_FAST_PATH_MODULE) || \
+	defined(CONFIG_FSL_DPAA_ASK_CEETM_TX_OWNER)
+	return 1;
+#else
+	return 0;
+#endif
+}
+
+
 static struct qman_fq *ceetm_get_egressfq(void *ctx, uint32_t channel, uint32_t classque, uint32_t ff)
 {
 	struct ceetm_chnl_info *chnl_ctx;
@@ -68,12 +79,12 @@ struct qman_fq *cdx_get_txfq(struct eth_iface_info *eth_info, void *info)
 	uint32_t quenum;
 #ifdef ENABLE_EGRESS_QOS
 	uint32_t ff = 1;
-	struct dpa_priv_s *priv;
+	struct tQM_context_ctl *qm_ctx;
 	struct qman_fq *egress_fq;
 
-	priv = netdev_priv(eth_info->net_dev);
-	if (priv->ceetm_en) {
-		egress_fq = ceetm_get_egressfq(priv->qm_ctx, qosmark->chnl_id, qosmark->queue,ff);
+	qm_ctx = QM_GET_CONTEXT(eth_info->portid);
+	if (qm_ctx->qos_enabled) {
+		egress_fq = ceetm_get_egressfq(qm_ctx, qosmark->chnl_id, qosmark->queue, ff);
 		if (!egress_fq) {
 			ceetm_err("%s::unable to get ceetm fqid for markval %x\n",
 				__FUNCTION__, qosmark->markval);
@@ -90,7 +101,7 @@ struct qman_fq *cdx_get_txfq(struct eth_iface_info *eth_info, void *info)
 int cdx_get_tx_dscp_fq_map(struct eth_iface_info *eth_info, uint8_t *is_dscp_fq_map, void* info)
 {
 #ifdef ENABLE_EGRESS_QOS
-	struct dpa_priv_s *priv;
+	struct tQM_context_ctl *qm_ctx;
 	U32 mark = 0; /* Default queue */
 	union ctentry_qosmark *qosmark = (union ctentry_qosmark *)&mark;
 
@@ -99,10 +110,10 @@ int cdx_get_tx_dscp_fq_map(struct eth_iface_info *eth_info, uint8_t *is_dscp_fq_
 		if(info)
 			qosmark = info;
 
-		priv = netdev_priv(eth_info->net_dev);
-		if ((priv) && (priv->ceetm_en)) {
+		qm_ctx = QM_GET_CONTEXT(eth_info->portid);
+		if (qm_ctx->qos_enabled) {
 			if ((!qosmark->markval) && /* No QOSCONNMARK */
-				((struct tQM_context_ctl *)priv->qm_ctx)->dscp_fq_map) /* DSCP FQ MAP enabled */
+				qm_ctx->dscp_fq_map) /* DSCP FQ MAP enabled */
 				*is_dscp_fq_map = 1;
 			else
 				*is_dscp_fq_map = 0;
@@ -116,6 +127,7 @@ int cdx_get_tx_dscp_fq_map(struct eth_iface_info *eth_info, uint8_t *is_dscp_fq_
  * This function returns the dscp fq pointer from corresponding interface QM CTX. *
  * In success case it returns the fq pointer otherwise returns NULL.              *
 */
+#if defined(CONFIG_CPE_FAST_PATH) || defined(CONFIG_FSL_DPAA_ASK_CEETM_TX_OWNER)
 static struct qman_fq *ceetm_get_dscp_fq(void *ctx, uint8_t dscp)
 {
 	struct tQM_context_ctl *qm_ctx = (struct tQM_context_ctl *)ctx;
@@ -130,6 +142,7 @@ static struct qman_fq *ceetm_get_dscp_fq(void *ctx, uint8_t dscp)
 
 	return qm_ctx->dscp_fq_map->dscp_fq[dscp];
 }
+#endif
 
 /* get count of frames on a CEETM class queue */
 static int ceetm_get_fqcount(struct ceetm_chnl_info *chnl_ctx, uint32_t classque, uint32_t *fqcount)
@@ -859,12 +872,14 @@ int ceetm_init_channels(void)
 			return CEETM_FAILURE;
 		chinfo++;
 	}
+#if defined(CONFIG_CPE_FAST_PATH) || defined(CONFIG_FSL_DPAA_ASK_CEETM_TX_OWNER)
 	/* register functions to return CEETM egress FQID */
 	if (dpa_register_ceetm_get_egress_fq(ceetm_get_egressfq, ceetm_get_dscp_fq)) {
 		ceetm_err("%s::unable to register ceetmFq functions\n", __FUNCTION__);
 		return CEETM_FAILURE;
 	}
 	ceetm_dbg("%s::registered ceetmFq functions\n", __FUNCTION__);
+#endif
 	return CEETM_SUCCESS;
 }
 
@@ -1081,6 +1096,13 @@ int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper)
 		return QOS_ENERR_NOT_CONFIGURED;
 	if (oper) {
 		if (!qm_ctx->qos_enabled) {
+			if (!ceetm_runtime_tx_owner_supported()) {
+				ceetm_err("%s: refusing CEETM enable on iface %s: "
+					"kernel TX path lacks CONFIG_CPE_FAST_PATH/CONFIG_FSL_DPAA_ASK_CEETM_TX_OWNER\n",
+					__FUNCTION__, qm_ctx->iface_info ?
+					(char *)qm_ctx->iface_info->name : "<unknown>");
+				return QOS_ENERR_IO;
+			}
 
 			/* initialize lni */
 			if (ceetm_setup_lni(qm_ctx)) {
@@ -1122,7 +1144,9 @@ int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper)
 				ceetm_err("%s:qman_sp_enable_ceetm_mode failed \n", __FUNCTION__);
 				return QOS_ENERR_IO;
 			} 
+#if defined(CONFIG_CPE_FAST_PATH) || defined(CONFIG_FSL_DPAA_ASK_CEETM_TX_OWNER)
 			dpa_enable_ceetm(qm_ctx->net_dev);
+#endif
 			qm_ctx->qos_enabled = 1;
 			ceetm_dbg("%s::CEETM enabled on iface %s\n", __FUNCTION__,
 				qm_ctx->iface_info->name);
@@ -1149,6 +1173,9 @@ int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper)
 					}
 				}
 			}
+#if defined(CONFIG_CPE_FAST_PATH) || defined(CONFIG_FSL_DPAA_ASK_CEETM_TX_OWNER)
+			dpa_disable_ceetm(qm_ctx->net_dev);
+#endif
 			qm_ctx->qos_enabled = 0;
 		} else {
 			ceetm_dbg("%s::already disabled\n",__FUNCTION__);
@@ -1750,12 +1777,14 @@ int ceetm_get_cq_query(pQosCqQueryCmd cmd)
 #ifdef ENABLE_EGRESS_QOS
 int ceetm_exit(void)
 {
+#if defined(CONFIG_CPE_FAST_PATH) || defined(CONFIG_FSL_DPAA_ASK_CEETM_TX_OWNER)
 	/* deregister functions to return CEETM egress FQID */
 	if (dpa_register_ceetm_get_egress_fq(NULL, NULL)) {
 		ceetm_err("%s::unable to deregister ceetmFq functions\n", __FUNCTION__);
 		return CEETM_FAILURE;
 	}
 	ceetm_dbg("%s::deregistered ceetmFq functions\n", __FUNCTION__);
+#endif
 
 	/* TODO: Implement proper cleanup for module unload. Currently leaks:
 	 * - 8 channel structures (kzalloc'd in ceetm_create_channel)

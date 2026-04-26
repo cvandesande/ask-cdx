@@ -458,13 +458,15 @@ int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info)
 	/* create lni */	
 	if (ceetm_create_lni(qm_ctx))
 		return FAILURE;
-	/* Add qm_ctx to priv structure */
+	/* Bind CDX QM context to the DPAA TX owner before qos on can succeed. */
+#if defined(CONFIG_CPE_FAST_PATH) || defined(CONFIG_FSL_DPAA_ASK_CEETM_TX_OWNER)
 	{
 		struct dpa_priv_s *priv;
 
 		priv = netdev_priv(qm_ctx->net_dev);
 		priv->qm_ctx = qm_ctx;
 	}
+#endif
 #endif
 	return SUCCESS;
 }
