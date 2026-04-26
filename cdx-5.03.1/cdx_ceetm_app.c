@@ -1350,8 +1350,13 @@ int ceetm_assign_chnl(struct tQM_context_ctl *qm_ctx, uint32_t channel_num)
 	}
 	chnl_ctx = &qm_chnl_info[channel_num];
 	if (chnl_ctx->qm_ctx) {
+		if (chnl_ctx->qm_ctx == qm_ctx) {
+			ceetm_dbg("%s::channel number %d already assigned to iface %s\n",
+				__FUNCTION__, channel_num, qm_ctx->iface_info->name);
+			return CEETM_SUCCESS;
+		}
 		ceetm_err("%s::channel number %d already assigned to iface %s\n", 
-			__FUNCTION__, channel_num, qm_ctx->iface_info->name);
+			__FUNCTION__, channel_num, chnl_ctx->qm_ctx->iface_info->name);
 		return CEETM_FAILURE;
 	}
 	channel = chnl_ctx->channel;
