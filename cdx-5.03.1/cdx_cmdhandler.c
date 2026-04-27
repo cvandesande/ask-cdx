@@ -9,17 +9,16 @@
  */
 #include "cdx.h"
 #include "control_bridge.h"
-#include "control_natpt.h"
 #include "control_pppoe.h"
-#include "control_socket.h"
 #include "control_stat.h"
 #include "control_tunnel.h"
 #include "control_tx.h"
 #include "control_vlan.h"
 #include "dpa_control_mc.h"
 #include "fm_ehash.h"
+#include <net/pkt_sched.h>
+#include <linux/fsl_qman.h>
 #include "module_qm.h"
-#include "module_rtp_relay.h"
 #ifdef CFG_WIFI_OFFLOAD
 #include "control_wifi.h"
 #endif
@@ -97,6 +96,81 @@ struct cdx_ingress_policer_reset_cmd {
 struct cdx_ipr_statistics_cmd {
 	U16 ackstats;
 	struct ip_reassembly_info info;
+};
+
+#define CDX_RTP_SPECIAL_PAYLOAD_LEN	160
+
+struct cdx_rtp_open_cmd {
+	U16 call_id;
+	U16 socket_a;
+	U16 socket_b;
+	U16 reserved;
+};
+
+struct cdx_rtp_close_cmd {
+	U16 call_id;
+	U16 reserved;
+};
+
+struct cdx_rtp_takeover_cmd {
+	U16 call_id;
+	U16 socket;
+	U16 mode;
+	U16 seq_number_base;
+	U32 ssrc;
+	U32 timestamp_base;
+	U32 timestamp_incr;
+	U32 ssrc_1;
+	U8 param_flags;
+	U8 marker_bit_conf_mode;
+	U16 reserved;
+};
+
+struct cdx_rtp_control_cmd {
+	U16 call_id;
+	U16 control_dir;
+	U16 vlan_pbit_conf;
+	U16 reserved;
+};
+
+struct cdx_rtp_spec_tx_ctrl_cmd {
+	U16 call_id;
+	U16 type;
+};
+
+struct cdx_rtp_spec_tx_payload_cmd {
+	U16 call_id;
+	U16 payload_id;
+	U16 payload_length;
+	U16 payload[CDX_RTP_SPECIAL_PAYLOAD_LEN / 2];
+};
+
+struct cdx_rtcp_query_cmd {
+	U16 socket_id;
+	U16 flags;
+};
+
+struct cdx_rtp_dtmf_pt_cmd {
+	U16 pt;
+};
+
+struct cdx_natpt_open_cmd {
+	U16 socket_a;
+	U16 socket_b;
+	U16 control;
+	U16 reserved;
+};
+
+struct cdx_natpt_close_cmd {
+	U16 socket_a;
+	U16 socket_b;
+};
+
+struct cdx_natpt_query_cmd {
+	U16 reserved1;
+	U16 socket_a;
+	U16 socket_b;
+	U16 reserved2;
 };
 
 #define CDX_CMD_LEN(_fcode, _type) \
@@ -181,15 +255,15 @@ static const struct cdx_cmd_len_spec cdx_cmd_len_specs[] = {
 	CDX_CMD_LEN_RANGE(CMD_MC4_MULTICAST, MC4_MIN_COMMAND_SIZE, sizeof(MC4Command)),
 	CDX_CMD_LEN_RANGE(CMD_MC6_MULTICAST, MC6_MIN_COMMAND_SIZE, sizeof(MC6Command)),
 
-	CDX_CMD_LEN(CMD_RTP_OPEN, RTPOpenCommand),
-	CDX_CMD_LEN(CMD_RTP_UPDATE, RTPOpenCommand),
-	CDX_CMD_LEN(CMD_RTP_TAKEOVER, RTPTakeoverCommand),
-	CDX_CMD_LEN(CMD_RTP_CONTROL, RTPControlCommand),
-	CDX_CMD_LEN(CMD_RTP_SPECTX_PLD, RTPSpecTxPayloadCommand),
-	CDX_CMD_LEN(CMD_RTP_SPECTX_CTRL, RTPSpecTxCtrlCommand),
-	CDX_CMD_LEN(CMD_RTCP_QUERY, RTCPQueryCommand),
-	CDX_CMD_LEN(CMD_RTP_CLOSE, RTPCloseCommand),
-	CDX_CMD_LEN(CMD_RTP_STATS_DTMF_PT, RTP_DTMF_PT_COMMAND),
+	CDX_CMD_LEN(CMD_RTP_OPEN, struct cdx_rtp_open_cmd),
+	CDX_CMD_LEN(CMD_RTP_UPDATE, struct cdx_rtp_open_cmd),
+	CDX_CMD_LEN(CMD_RTP_TAKEOVER, struct cdx_rtp_takeover_cmd),
+	CDX_CMD_LEN(CMD_RTP_CONTROL, struct cdx_rtp_control_cmd),
+	CDX_CMD_LEN(CMD_RTP_SPECTX_PLD, struct cdx_rtp_spec_tx_payload_cmd),
+	CDX_CMD_LEN(CMD_RTP_SPECTX_CTRL, struct cdx_rtp_spec_tx_ctrl_cmd),
+	CDX_CMD_LEN(CMD_RTCP_QUERY, struct cdx_rtcp_query_cmd),
+	CDX_CMD_LEN(CMD_RTP_CLOSE, struct cdx_rtp_close_cmd),
+	CDX_CMD_LEN(CMD_RTP_STATS_DTMF_PT, struct cdx_rtp_dtmf_pt_cmd),
 	CDX_CMD_LEN_BYTES(CMD_VOICE_BUFFER_RESET, 0),
 
 	CDX_CMD_LEN(CMD_VLAN_ENTRY, VlanCommand),
@@ -216,9 +290,9 @@ static const struct cdx_cmd_len_spec cdx_cmd_len_specs[] = {
 	CDX_CMD_LEN(FPP_CMD_IPR_V4_STATS, struct cdx_ipr_statistics_cmd),
 	CDX_CMD_LEN(FPP_CMD_IPR_V6_STATS, struct cdx_ipr_statistics_cmd),
 
-	CDX_CMD_LEN(CMD_NATPT_OPEN, NATPTOpenCommand),
-	CDX_CMD_LEN(CMD_NATPT_CLOSE, NATPTCloseCommand),
-	CDX_CMD_LEN(CMD_NATPT_QUERY, NATPTQueryCommand),
+	CDX_CMD_LEN(CMD_NATPT_OPEN, struct cdx_natpt_open_cmd),
+	CDX_CMD_LEN(CMD_NATPT_CLOSE, struct cdx_natpt_close_cmd),
+	CDX_CMD_LEN(CMD_NATPT_QUERY, struct cdx_natpt_query_cmd),
 
 #ifdef CFG_WIFI_OFFLOAD
 	CDX_CMD_LEN(CMD_WIFI_VAP_ENTRY, struct wifiCmd),
