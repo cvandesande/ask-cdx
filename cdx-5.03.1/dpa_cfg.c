@@ -19,6 +19,7 @@
 #include <linux/slab.h>
 #include <linux/fdtable.h>
 #include <linux/fs.h>
+#include <linux/cdev.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
 //#include <linux/fsl_dpa_classifier.h>
