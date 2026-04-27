@@ -230,6 +230,8 @@ static const struct cdx_cmd_len_spec cdx_cmd_len_specs[] = {
 	CDX_CMD_LEN(CMD_IPV4_SET_TIMEOUT, TimeoutCommand),
 	CDX_CMD_LEN(CMD_IPV4_GET_TIMEOUT, CtCommand),
 	CDX_CMD_LEN(CMD_IPV4_FF_CONTROL, FFControlCommand),
+	CDX_CMD_LEN(CMD_IPV4_FRAGTIMEOUT, FragTimeoutCommand),
+	CDX_CMD_LEN(CMD_IPV4_SAM_FRAGTIMEOUT, FragTimeoutCommand),
 	CDX_CMD_LEN(CMD_IPV4_SOCK_OPEN, SockOpenCommand),
 	CDX_CMD_LEN(CMD_IPV4_SOCK_CLOSE, SockCloseCommand),
 	CDX_CMD_LEN(CMD_IPV4_SOCK_UPDATE, SockUpdateCommand),
@@ -237,6 +239,7 @@ static const struct cdx_cmd_len_spec cdx_cmd_len_specs[] = {
 	CDX_CMD_LEN_ALT(CMD_IPV6_CONNTRACK, CtCommandIPv6, CtExCommandIPv6),
 	CDX_CMD_LEN_BYTES(CMD_IPV6_RESET, 0),
 	CDX_CMD_LEN(CMD_IPV6_GET_TIMEOUT, CtCommandIPv6),
+	CDX_CMD_LEN(CMD_IPV6_FRAGTIMEOUT, FragTimeoutCommand),
 	CDX_CMD_LEN(CMD_IPV6_SOCK_OPEN, Sock6OpenCommand),
 	CDX_CMD_LEN(CMD_IPV6_SOCK_CLOSE, Sock6CloseCommand),
 	CDX_CMD_LEN(CMD_IPV6_SOCK_UPDATE, Sock6UpdateCommand),
@@ -272,6 +275,13 @@ static const struct cdx_cmd_len_spec cdx_cmd_len_specs[] = {
 	CDX_CMD_LEN(CMD_TNL_CREATE, TNLCommand_create),
 	CDX_CMD_LEN(CMD_TNL_DELETE, TNLCommand_delete),
 	CDX_CMD_LEN(CMD_TNL_UPDATE, TNLCommand_create),
+#ifdef CDX_TODO_IPSEC
+	CDX_CMD_LEN(CMD_TNL_IPSEC, TNLCommand_ipsec),
+#endif
+#ifdef CDX_TODO_TUNNEL
+	CDX_CMD_LEN(CMD_TNL_4o6_ID_CONVERSION_dupsport, TNLCommand_IdConvDP),
+	CDX_CMD_LEN(CMD_TNL_4o6_ID_CONVERSION_psid, TNLCommand_IdConvPsid),
+#endif
 	CDX_CMD_LEN(CMD_TNL_QUERY, TNLCommand_query),
 	CDX_CMD_LEN(CMD_TNL_QUERY_CONT, TNLCommand_query),
 
@@ -282,6 +292,8 @@ static const struct cdx_cmd_len_spec cdx_cmd_len_specs[] = {
 	CDX_CMD_LEN_BYTES(CMD_STAT_PPPOE_ENTRY, 0),
 	CDX_CMD_LEN(CMD_STAT_BRIDGE_STATUS, struct cdx_stat_action_pad_cmd),
 	CDX_CMD_LEN_BYTES(CMD_STAT_BRIDGE_ENTRY, 0),
+	CDX_CMD_LEN(CMD_STAT_IPSEC_STATUS, StatIpsecStatusCmd),
+	CDX_CMD_LEN_BYTES(CMD_STAT_IPSEC_ENTRY, 0),
 	CDX_CMD_LEN(CMD_STAT_VLAN_STATUS, struct cdx_stat_action_pad_cmd),
 	CDX_CMD_LEN_BYTES(CMD_STAT_VLAN_ENTRY, 0),
 	CDX_CMD_LEN(CMD_STAT_TUNNEL_STATUS, StatTunnelStatusCmd),
