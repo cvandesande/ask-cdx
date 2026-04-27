@@ -105,8 +105,10 @@ int IPv6_delete_CTpair(PCtEntry ctEntry)
 		goto err;
 	}
 
-	if (msg_send(pmsg) < 0)
-		goto err;
+	if (msg_send(pmsg) < 0) {
+		DPRINT_ERROR("removed CT but failed to send notification\n");
+		return 0;
+	}
 
 	return 0;
 

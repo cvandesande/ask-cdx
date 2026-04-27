@@ -415,8 +415,10 @@ int IPv4_delete_CTpair(PCtEntry ctEntry)
 		goto err;
 	}
 
-	if (msg_send(pmsg) < 0)
-		goto err;
+	if (msg_send(pmsg) < 0) {
+		DPRINT_ERROR("removed CT but failed to send notification\n");
+		return 0;
+	}
 
 	return 0;
 
@@ -489,7 +491,7 @@ int ct_aging_handler(TIMER_ENTRY *timer)
 		if (rc == 0) {
 			return 0;	// ct delete succeeded
 		}
-		// notification failed -- try again next timer tick
+		// hardware delete failed -- try again next timer tick
 		timer->period = 1;
 	}
 	//DPRINT_ERROR("new period=%u\n", timer->period);

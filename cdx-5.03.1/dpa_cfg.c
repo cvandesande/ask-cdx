@@ -19,6 +19,8 @@
 #include <linux/slab.h>
 #include <linux/fdtable.h>
 #include <linux/fs.h>
+#include <linux/of.h>
+#include <linux/of_platform.h>
 //#include <linux/fsl_dpa_classifier.h>
 #include "dpaa_eth.h"
 #include "fm_ioctls.h"
@@ -39,6 +41,52 @@ struct cdx_fman_info *fman_info;
 static struct dpa_fq *dpa_pcd_fq;
 //ipr info received via ioctl
 struct cdx_ipr_info ipr_info;
+
+struct fm;
+extern struct fm *fm_bind(struct device *fm_dev);
+extern void fm_unbind(struct fm *fm);
+
+static int cdxdrv_bind_fman_by_index(uint32_t index,
+				     t_LnxWrpFmDev **fm_wrapper_dev)
+{
+	struct device_node *fm_node;
+	struct platform_device *pdev;
+	t_LnxWrpFmDev *wrapper_dev;
+	const uint32_t *cell_index;
+	int lenp;
+
+	*fm_wrapper_dev = NULL;
+
+	for_each_compatible_node(fm_node, NULL, "fsl,fman") {
+		cell_index = of_get_property(fm_node, "cell-index", &lenp);
+		if (!cell_index || lenp != sizeof(*cell_index))
+			continue;
+
+		if (be32_to_cpu(*cell_index) != index)
+			continue;
+
+		pdev = of_find_device_by_node(fm_node);
+		of_node_put(fm_node);
+		if (!pdev)
+			return -ENODEV;
+
+		wrapper_dev = dev_get_drvdata(&pdev->dev);
+		if (!wrapper_dev) {
+			put_device(&pdev->dev);
+			return -ENODEV;
+		}
+
+		wrapper_dev = (t_LnxWrpFmDev *)fm_bind(&pdev->dev);
+		put_device(&pdev->dev);
+		if (!wrapper_dev)
+			return -ENODEV;
+
+		*fm_wrapper_dev = wrapper_dev;
+		return 0;
+	}
+
+	return -ENODEV;
+}
 
 #ifdef DPA_CFG_DEBUG
 //show port related info
@@ -598,6 +646,7 @@ static int cdxdrv_get_fman_handles(struct cdx_fman_info *finfo)
 	struct file *fm_pcd_file;
 	struct inode *inode;
 	t_LnxWrpFmDev *fm_wrapper_dev;
+	int rc;
 
 	//get handle - use fget() instead of fcheck() for kernel 5.7+
 	fm_pcd_file = fget((unsigned long)finfo->pcd_handle);
@@ -614,11 +663,27 @@ static int cdxdrv_get_fman_handles(struct cdx_fman_info *finfo)
 		fput(fm_pcd_file);
 		return -1;
 	}
-	//map it to wrapper dev
-	fm_wrapper_dev = (t_LnxWrpFmDev *)fm_pcd_file->private_data;
-	if (!fm_wrapper_dev) {
-		DPA_ERROR("%s::null wrap dev for pcd 0x%p\n",
+
+	rc = cdxdrv_bind_fman_by_index(finfo->index, &fm_wrapper_dev);
+	if (rc < 0) {
+		DPA_ERROR("%s::failed to bind fman index %u for pcd 0x%p\n",
+				__FUNCTION__, finfo->index, finfo->pcd_handle);
+		fput(fm_pcd_file);
+		return -1;
+	}
+	if (imajor(inode) != fm_wrapper_dev->major ||
+	    fm_pcd_file->private_data != fm_wrapper_dev) {
+		DPA_ERROR("%s::PCD fd does not belong to fman index %u\n",
+				__FUNCTION__, finfo->index);
+		fm_unbind((struct fm *)fm_wrapper_dev);
+		fput(fm_pcd_file);
+		return -1;
+	}
+	if (!fm_pcd_file->f_op || !inode->i_cdev ||
+	    fm_pcd_file->f_op != inode->i_cdev->ops) {
+		DPA_ERROR("%s::invalid PCD fd operations for pcd 0x%p\n",
 				__FUNCTION__, finfo->pcd_handle);
+		fm_unbind((struct fm *)fm_wrapper_dev);
 		fput(fm_pcd_file);
 		return -1;
 	}
@@ -627,6 +692,7 @@ static int cdxdrv_get_fman_handles(struct cdx_fman_info *finfo)
 	    !fm_wrapper_dev->h_MuramDev || fm_wrapper_dev->id != finfo->index) {
 		DPA_ERROR("%s::null pcd dev for pcd 0x%p\n",
 				__FUNCTION__, finfo->pcd_handle);
+		fm_unbind((struct fm *)fm_wrapper_dev);
 		fput(fm_pcd_file);
 		return -1;
 	}
@@ -636,6 +702,7 @@ static int cdxdrv_get_fman_handles(struct cdx_fman_info *finfo)
 	finfo->muram_handle = fm_wrapper_dev->h_MuramDev;
 	finfo->physicalMuramBase = fm_wrapper_dev->fmMuramPhysBaseAddr;
 	finfo->fmMuramMemSize = fm_wrapper_dev->fmMuramMemSize;
+	fm_unbind((struct fm *)fm_wrapper_dev);
 	fput(fm_pcd_file);
 	return 0;
 }
