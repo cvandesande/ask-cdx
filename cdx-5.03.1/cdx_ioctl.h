@@ -24,6 +24,11 @@
 #define CDX_CTRL_CLS_CDEVNAME   CDX_CTRL_CDEVNAME
 #define CDX_IOC_MAGIC           0xbe
 
+#define CDX_CTRL_MAX_FMANS		2
+#define CDX_CTRL_MAX_PORTS_PER_FMAN	5
+#define CDX_CTRL_MAX_TABLES_PER_FMAN	64
+#define CDX_CTRL_MAX_TEST_CONN		1024
+
 //table create ioctl
 #define CDX_CTRL_TBL_NAME_LEN	64
 #define CDX_CTRL_PORT_NAME_LEN	32	
@@ -82,6 +87,7 @@ enum {
 	IPV6_FRAG_DIST,
 	MAX_DIST_TYPES
 };
+#define CDX_CTRL_MAX_DIST_PER_PORT	MAX_DIST_TYPES
 
 //port distribution info
 struct cdx_dist_info {

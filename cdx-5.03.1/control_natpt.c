@@ -122,7 +122,8 @@ static int NATPT_Close(U16 *p, U16 Length)
 	SOCKET_unbind(pEntry_6to4->socket);
 	SOCKET_unbind(pEntry_4to6->socket);
 
-	ct_remove(pEntry_6to4);
+	if (ct_remove(pEntry_6to4))
+		return ERR_CREATION_FAILED;
 
 	return NO_ERR;
 }

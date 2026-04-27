@@ -99,16 +99,19 @@ int IPv6_delete_CTpair(PCtEntry ctEntry)
 	pmsg->code = CMD_IPV6_CONNTRACK_CHANGE;
 	pmsg->length = sizeof(*message);
 
+	//Remove conntrack from list
+	if (ct_remove(ctEntry)) {
+		msg_free(pmsg);
+		goto err;
+	}
+
 	if (msg_send(pmsg) < 0)
 		goto err;
-
-	//Remove conntrack from list
-	ct_remove(ctEntry);
 
 	return 0;
 
 err:
-	/* Can't send indication, try later from timeout routine */
+	/* Keep retrying only when hardware delete did not complete. */
 	return 1;
 }
 
@@ -215,7 +218,8 @@ static int IPv6_handle_CONNTRACK(U16 *p, U16 Length)
 					CT_TWIN(pEntry_orig) != pEntry_rep || CT_TWIN(pEntry_rep) != pEntry_orig)
 				return ERR_CT_ENTRY_NOT_FOUND;
 
-			ct_remove(pEntry_orig);
+			if (ct_remove(pEntry_orig))
+				return ERR_CREATION_FAILED;
 			break;
 
 		case ACTION_REGISTER: //Add entry
@@ -660,6 +664,7 @@ static int IPv6_CT_Get_Hash_Snapshot(int ct6_hash_index,int v6_ct_total_entries,
 			pSnapshot->SportReply = 	twin_entry->Sport;
 			pSnapshot->DportReply = 	twin_entry->Dport;
 			pSnapshot->protocol   =  GET_PROTOCOL(pCtEntry); 
+			pSnapshot->flags = pCtEntry->status;
 			pSnapshot->qosconnmark     = IP_get_qosconnmark((PCtEntry)pCtEntry, (PCtEntry)twin_entry);
 			pSnapshot->SA_nr      =	0;
 			pSnapshot->SAReply_nr	= 	0;

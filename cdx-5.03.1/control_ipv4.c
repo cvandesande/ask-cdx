@@ -159,8 +159,19 @@ int ct_add(PCtEntry pEntry_orig, TIMER_HANDLER handler)
 	return NO_ERR;
 
 err1:
-	if (pEntry_orig->status & CONNTRACK_HWSET)
-		delete_entry_from_classif_table(pEntry_orig);
+	if (pEntry_orig->status & CONNTRACK_HWSET) {
+		if (delete_entry_from_classif_table(pEntry_orig)) {
+			pEntry_orig->status |= CONNTRACK_DEL_FAILED;
+			DPRINT_ERROR("failed to delete partial orig entry\n");
+			slist_add(&ct_cache[pEntry_orig->hash], &pEntry_orig->list);
+			slist_add(&ct_cache[pEntry_rep->hash], &pEntry_rep->list);
+			atomic_inc(&num_active_connections);
+			cdx_timer_init(&ppair->timer, handler);
+			ct_timer_update(ppair);
+			return rc;
+		}
+		pEntry_orig->status &= ~(CONNTRACK_HWSET | CONNTRACK_DEL_FAILED);
+	}
 
 err0:
 	IP_delete_CT_route(pEntry_orig);
@@ -179,34 +190,31 @@ err0:
  *
  * @return		NO_ERR in case of success, ERR_xxx in case of error
  */
-void ct_remove(PCtEntry pEntry_orig)
+int ct_remove(PCtEntry pEntry_orig)
 {
 	PCT_PAIR ppair = container_of(pEntry_orig, CT_PAIR, orig);
 	PCtEntry pEntry_rep = &ppair->repl;
+	int delete_failed = 0;
+
+	if ((pEntry_orig->status & CONNTRACK_HWSET) && delete_entry_from_classif_table(pEntry_orig)) {
+		pEntry_orig->status |= CONNTRACK_DEL_FAILED;
+		delete_failed = 1;
+		DPRINT_ERROR("failed to delete orig entry\n");
+	} else {
+		pEntry_orig->status &= ~(CONNTRACK_HWSET | CONNTRACK_DEL_FAILED);
+	}
+	if ((pEntry_rep->status & CONNTRACK_HWSET) && delete_entry_from_classif_table(pEntry_rep)) {
+		pEntry_rep->status |= CONNTRACK_DEL_FAILED;
+		delete_failed = 1;
+		DPRINT_ERROR("failed to delete reply entry\n");
+	} else {
+		pEntry_rep->status &= ~(CONNTRACK_HWSET | CONNTRACK_DEL_FAILED);
+	}
+
+	if (delete_failed)
+		return FAILURE;
 
 	cdx_timer_del(&ppair->timer);
-
-	if ((pEntry_orig->status & CONNTRACK_HWSET) && delete_entry_from_classif_table(pEntry_orig))
-		DPRINT_ERROR("failed to delete orig entry\n");
-	if ((pEntry_rep->status & CONNTRACK_HWSET) && delete_entry_from_classif_table(pEntry_rep))
-		DPRINT_ERROR("failed to delete reply entry\n");
-
-	if (pEntry_orig->status & CONNTRACK_DEL_FAILED)
-	{
-		/* free table entry */
-		ExternalHashTableEntryFree(pEntry_orig->ct->handle);
-		pEntry_orig->ct->handle =  NULL;
-		kfree(pEntry_orig->ct);
-		pEntry_orig->ct = NULL;
-	}
-	if (pEntry_rep->status & CONNTRACK_DEL_FAILED)
-	{
-		/* free table entry */
-		ExternalHashTableEntryFree(pEntry_rep->ct->handle);
-		pEntry_rep->ct->handle =  NULL;
-		kfree(pEntry_rep->ct);
-		pEntry_rep->ct = NULL;
-	}
 
 	IP_delete_CT_route(pEntry_orig);
 	IP_delete_CT_route(pEntry_rep);
@@ -220,6 +228,7 @@ void ct_remove(PCtEntry pEntry_orig)
 	ct_free(pEntry_orig);
 
 	atomic_dec(&num_active_connections);
+	return SUCCESS;
 }
 
 
@@ -260,11 +269,10 @@ static void ct_update_one(PCtEntry pEntry)
 		if(rc)
 		{
 			pEntry->status |= CONNTRACK_DEL_FAILED;
-			pEntry->status &= ~CONNTRACK_HWSET;
 			DPRINT_ERROR("failed to delete entry\n");
 		}
 		else
-			pEntry->status &= ~CONNTRACK_HWSET;
+			pEntry->status &= ~(CONNTRACK_HWSET | CONNTRACK_DEL_FAILED);
 
 		return;
 	}
@@ -401,16 +409,19 @@ int IPv4_delete_CTpair(PCtEntry ctEntry)
 	pmsg->code = CMD_IPV4_CONNTRACK_CHANGE;
 	pmsg->length = sizeof(*message);
 
+	//Remove conntrack from list
+	if (ct_remove(ctEntry)) {
+		msg_free(pmsg);
+		goto err;
+	}
+
 	if (msg_send(pmsg) < 0)
 		goto err;
-
-	//Remove conntrack from list
-	ct_remove(ctEntry);
 
 	return 0;
 
 err:
-	/* Can't send indication, try later from timeout routine */
+	/* Keep retrying only when hardware delete did not complete. */
 	return 1;
 }
 
@@ -565,7 +576,8 @@ static int IPv4_HandleIP_CONNTRACK(U16 *p, U16 Length)
 					((pEntry_orig->status & CONNTRACK_ORIG) != CONNTRACK_ORIG))
 				return ERR_CT_ENTRY_NOT_FOUND;
 
-			ct_remove(pEntry_orig);
+			if (ct_remove(pEntry_orig))
+				return ERR_CREATION_FAILED;
 			break;
 
 		case ACTION_REGISTER:
@@ -1122,7 +1134,8 @@ static int IPv4_HandleIP_RESET (void)
 		while ((entry = slist_first(&ct_cache[i])) != NULL)
 		{
 			pEntry_orig = CT_ORIG(container_of(entry, CtEntry, list));
-			ct_remove(pEntry_orig);
+			if (ct_remove(pEntry_orig))
+				return ERR_CREATION_FAILED;
 		}
 	}
 
@@ -1490,6 +1503,7 @@ static int IPv4_CT_Get_Hash_Snapshot(int ct_hash_index, int ct_total_entries, PC
 			pSnapshot->SportReply = 	pCtEntry->twin_Sport;
 			pSnapshot->DportReply = 	pCtEntry->twin_Dport;
 			pSnapshot->protocol   =  GET_PROTOCOL(pCtEntry); 
+			pSnapshot->flags = pCtEntry->status;
 			pSnapshot->qosconnmark     = IP_get_qosconnmark(pCtEntry, pReplyEntry);
 			pSnapshot->SA_nr      =	0;
 			pSnapshot->SAReply_nr	= 	0;

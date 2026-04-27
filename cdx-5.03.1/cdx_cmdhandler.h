@@ -334,12 +334,12 @@ enum EVENTS {
 #define CMD_ERR 0xFFFE
 
 int FCODE_TO_EVENT(U32 fcode);
-void cdx_cmd_handler(U16 fcode, U16 length, U16 *payload, U16 *rlen, U16 *rbuf);
+int cdx_cmd_handler(U16 fcode, U16 length, U16 *payload, U16 *rlen, U16 *rbuf, U16 rbuf_len);
 void comcerto_fpp_workqueue(struct work_struct *work);
 int cdx_cmdhandler_init(void);
 void cdx_cmdhandler_exit(void);
 
-int comcerto_fpp_send_command(u16 fcode, u16 length, u16 *payload, u16 *rlen, u16 *rbuf);
+int comcerto_fpp_send_command(u16 fcode, u16 length, u16 *payload, u16 *rlen, u16 *rbuf, u16 rbuf_len);
 int comcerto_fpp_send_command_simple(u16 fcode, u16 length, u16 *payload);
 int comcerto_fpp_send_command_atomic(u16 fcode, u16 length, u16 *payload,
 	void (*callback)(unsigned long, int, u16, u16 *), unsigned long data);

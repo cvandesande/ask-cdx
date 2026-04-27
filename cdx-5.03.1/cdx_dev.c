@@ -19,6 +19,7 @@
 #include <linux/uaccess.h>
 #include <linux/slab.h>
 #include <linux/fdtable.h>
+#include <linux/capability.h>
 
 #include "portdefs.h"
 #include "misc.h"
@@ -149,6 +150,9 @@ long cdx_ctrl_ioctl(struct file *filp, unsigned int cmd,
 	int retval;
 
 	//DPA_INFO("%s::cmd %d\n", __FUNCTION__, cmd);
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
+
 	switch (cmd) {
 		case CDX_CTRL_DPA_SET_PARAMS:
 			retval = cdx_ioc_set_dpa_params(args);
@@ -194,7 +198,10 @@ long cdx_ctrl_compat_ioctl(struct file *filp, unsigned int cmd,
                 unsigned long args)
 {
 	DPA_INFO("%s::\n", __FUNCTION__);
-	return 0;
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
+
+	return -EINVAL;
 }
 #endif
 
@@ -243,6 +250,5 @@ int cdx_driver_init(void)
 	register_cdx_deinit_func(cdx_driver_deinit);
 	return 0;
 }
-
 
 

@@ -11,6 +11,8 @@
 
 CmdProc gCmdProcTable[EVENT_MAX];
 
+#define CDX_CMD_MAX_REPLY_LENGTH	512
+
 int FCODE_TO_EVENT(U32 fcode)
 {
 	int eventid;
@@ -73,10 +75,20 @@ int FCODE_TO_EVENT(U32 fcode)
 	return eventid;
 }
 
-void cdx_cmd_handler(U16 fcode, U16 length, U16 *payload, U16 *rlen, U16 *rbuf)
+int cdx_cmd_handler(U16 fcode, U16 length, U16 *payload, U16 *rlen, U16 *rbuf, U16 rbuf_len)
 {
 	CmdProc cmdproc;
 	int eventid;
+
+	if (!rlen || !rbuf || (length && !payload))
+		return -EINVAL;
+
+	*rlen = 0;
+	if (rbuf_len < sizeof(U16))
+		return -EMSGSIZE;
+
+	if (length > rbuf_len)
+		return -EMSGSIZE;
 
 	eventid = FCODE_TO_EVENT(fcode);
 #ifdef CDX_DEBUG_ENABLE
@@ -109,6 +121,11 @@ void cdx_cmd_handler(U16 fcode, U16 length, U16 *payload, U16 *rlen, U16 *rbuf)
 	}
 	if (rbuf[0] != NO_ERR)
 		DPRINT("rbuf[0]=0x%04x, *rlen=%d\n", rbuf[0], *rlen);
+
+	if (*rlen > rbuf_len)
+		return -EMSGSIZE;
+
+	return 0;
 }
 
 #define CMD_DECLARE(xx)		\
@@ -225,17 +242,36 @@ void __exit cdx_cmdhandler_exit(void)
 	CMD_EXIT(tx);
 }
 
-int comcerto_fpp_send_command(u16 fcode, u16 length, u16 *payload, u16 *rlen, u16 *rbuf)
+int comcerto_fpp_send_command(u16 fcode, u16 length, u16 *payload, u16 *rlen, u16 *rbuf, u16 rbuf_len)
 {
 	struct _cdx_ctrl *ctrl = &cdx_info->ctrl;
+	u16 tmp_rbuf[CDX_CMD_MAX_REPLY_LENGTH / sizeof(u16)];
+	u16 tmp_rlen = 0;
+	int rc;
+
+	if (!rlen || !rbuf || (length && !payload))
+		return -EINVAL;
+
+	if (rbuf_len < sizeof(u16))
+		return -EMSGSIZE;
 
 	mutex_lock(&ctrl->mutex);
 
-	cdx_cmd_handler(fcode, length, payload, rlen, rbuf);
+	rc = cdx_cmd_handler(fcode, length, payload, &tmp_rlen, tmp_rbuf, sizeof(tmp_rbuf));
+
+	if (!rc) {
+		if (tmp_rlen > rbuf_len) {
+			rc = -EMSGSIZE;
+			tmp_rlen = 0;
+		} else if (tmp_rlen) {
+			memcpy(rbuf, tmp_rbuf, tmp_rlen);
+		}
+	}
+	*rlen = tmp_rlen;
 
 	mutex_unlock(&ctrl->mutex);
 
-	return 0;
+	return rc;
 }
 EXPORT_SYMBOL(comcerto_fpp_send_command);
 
@@ -261,7 +297,7 @@ int comcerto_fpp_send_command_simple(u16 fcode, u16 length, u16 *payload)
 	u16 rlen;
 	int rc;
 
-	rc = comcerto_fpp_send_command(fcode, length, payload, &rlen, rbuf);
+	rc = comcerto_fpp_send_command(fcode, length, payload, &rlen, rbuf, sizeof(rbuf));
 
 	/* if a command delivery error is detected, do not check command returned code */
 	if (rc < 0)
@@ -294,7 +330,7 @@ void comcerto_fpp_workqueue(struct work_struct *work)
 
 		spin_unlock_irqrestore(&ctrl->lock, flags);
 
-		rc = comcerto_fpp_send_command(msg->fcode, msg->length, msg->payload, &rlen, rbuf);
+		rc = comcerto_fpp_send_command(msg->fcode, msg->length, msg->payload, &rlen, rbuf, sizeof(rbuf));
 
 		/* send command response to caller's callback */
 		if (msg->callback != NULL)
@@ -378,7 +414,9 @@ int cdx_ctrl_send_command_simple(u16 fcode, u16 length, u16 *payload)
 	int rc;
 
 	/* send command to FE */
-	comcerto_fpp_send_command(fcode, length, payload, &rlen, rbuf);
+	rc = comcerto_fpp_send_command(fcode, length, payload, &rlen, rbuf, sizeof(rbuf));
+	if (rc < 0)
+		return rc;
 
 	/* retrieve FE command returned code. Could be error or acknowledgment */
 	rc = rbuf[0];
@@ -401,6 +439,3 @@ int comcerto_fpp_register_event_cb(int (*event_cb)(u16, u16, u16*))
 	return 0;
 }
 EXPORT_SYMBOL(comcerto_fpp_register_event_cb);
-
-
-

@@ -479,6 +479,11 @@ int delete_entry_from_classif_table(PCtEntry entry)
 		DPA_ERROR("%s:: Ct entry is NULL\n", __FUNCTION__);
 		return FAILURE;
 	}
+	if (!entry->ct || !entry->ct->handle)
+	{
+		DPA_ERROR("%s:: Ct hardware entry is NULL\n", __FUNCTION__);
+		return FAILURE;
+	}
 
 	CDX_DPA_DPRINT("\n");
 	if (ExternalHashTableDeleteKey(entry->ct->td, 
@@ -491,6 +496,7 @@ int delete_entry_from_classif_table(PCtEntry entry)
 	entry->ct->handle =  NULL;
 	kfree(entry->ct);
 	entry->ct = NULL;
+	entry->status &= ~(CONNTRACK_HWSET | CONNTRACK_DEL_FAILED);
 	return SUCCESS;
 }
 

@@ -78,9 +78,11 @@ int cdx_ioc_dpa_connadd(unsigned long args)
 	retval = 0;
 	ct = NULL;
 	rt = NULL;
-	conn_info = (struct test_conn_info *) 
-		kzalloc ((sizeof(struct test_conn_info) * add_conn.num_conn),
-				0);
+	if (!add_conn.num_conn || add_conn.num_conn > CDX_CTRL_MAX_TEST_CONN ||
+	    !add_conn.conn_info)
+		return -EINVAL;
+
+	conn_info = kcalloc(add_conn.num_conn, sizeof(*conn_info), GFP_KERNEL);
 	if (!conn_info) {
 		DPA_ERROR("%s::mem alloc for conn info failed\n", 
 				__FUNCTION__);
@@ -89,7 +91,7 @@ int cdx_ioc_dpa_connadd(unsigned long args)
 
 	}
 	if (copy_from_user(conn_info, add_conn.conn_info,
-				(sizeof(struct test_conn_info) * add_conn.num_conn))) {
+				sizeof(*conn_info) * add_conn.num_conn)) {
 		DPA_ERROR("%s::Read uspace args failed\n",
 				__FUNCTION__);
 		retval = -EIO;
