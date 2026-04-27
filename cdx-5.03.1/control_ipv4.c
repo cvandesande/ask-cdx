@@ -212,7 +212,7 @@ int ct_remove(PCtEntry pEntry_orig)
 	}
 
 	if (delete_failed)
-		return FAILURE;
+		return -1;
 
 	cdx_timer_del(&ppair->timer);
 
@@ -228,7 +228,7 @@ int ct_remove(PCtEntry pEntry_orig)
 	ct_free(pEntry_orig);
 
 	atomic_dec(&num_active_connections);
-	return SUCCESS;
+	return 0;
 }
 
 
