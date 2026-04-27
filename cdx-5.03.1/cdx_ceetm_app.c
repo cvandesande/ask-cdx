@@ -1285,8 +1285,8 @@ int ceetm_configure_cq(void *cmd)
 		
 	/* qdepth appliable to both queue types */
 	if (cfg->cfg_flags & CQ_TDINFO_VALID) {
-        	if(ceetm_cfg_td_on_class_queue(chnl_ctx, ceetm_quenum, cfg->tdthresh))
-                        return CEETM_FAILURE;
+		if (ceetm_cfg_td_on_class_queue(chnl_ctx, cfg->quenum, cfg->tdthresh))
+			return CEETM_FAILURE;
 		chnl_ctx->cq_info[cfg->quenum].qdepth = cfg->tdthresh;
 	}
 	if (cfg->cfg_flags & CQ_WEIGHT_VALID) {
@@ -1363,11 +1363,7 @@ int ceetm_assign_chnl(struct tQM_context_ctl *qm_ctx, uint32_t channel_num)
 	lni = qm_ctx->lni;
 	ceetm_dbg("%s::assigning channel %d(%d) to iface %s\n", __FUNCTION__, 
 			channel_num, chnl_ctx->idx, qm_ctx->iface_info->name);
-	chnl_ctx->qm_ctx = qm_ctx;
 	memset(&config_opts, 0, sizeof(struct qm_mcc_ceetm_mapping_shaper_tcfc_config));
-	channel->dcp_idx = lni->dcp_idx;
-	channel->lni_idx = lni->idx;
-	list_add_tail(&channel->node, &lni->channels);
 	config_opts.cid = cpu_to_be16(CEETM_COMMAND_CHANNEL_MAPPING |
 				channel_num);
 	config_opts.dcpid = lni->dcp_idx;
@@ -1378,6 +1374,10 @@ int ceetm_assign_chnl(struct tQM_context_ctl *qm_ctx, uint32_t channel_num)
 			channel_num, qm_ctx->iface_info->name);
 		return CEETM_FAILURE;
 	}
+	chnl_ctx->qm_ctx = qm_ctx;
+	channel->dcp_idx = lni->dcp_idx;
+	channel->lni_idx = lni->idx;
+	list_add_tail(&channel->node, &lni->channels);
 	qm_ctx->chnl_map |= (1 << chnl_ctx->idx);
 	ceetm_dbg("%s::lni %d, dcp %d, chnl_map %x\n", __FUNCTION__, lni->idx, lni->dcp_idx, qm_ctx->chnl_map);
 	/* if qos is enabled on port and channel shaper is on program values into shaper */

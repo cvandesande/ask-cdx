@@ -8,10 +8,249 @@
  *
  */
 #include "cdx.h"
+#include "control_bridge.h"
+#include "control_natpt.h"
+#include "control_pppoe.h"
+#include "control_socket.h"
+#include "control_stat.h"
+#include "control_tunnel.h"
+#include "control_tx.h"
+#include "control_vlan.h"
+#include "dpa_control_mc.h"
+#include "fm_ehash.h"
+#include "module_qm.h"
+#include "module_rtp_relay.h"
+#ifdef CFG_WIFI_OFFLOAD
+#include "control_wifi.h"
+#endif
 
 CmdProc gCmdProcTable[EVENT_MAX];
 
 #define CDX_CMD_MAX_REPLY_LENGTH	512
+
+enum cdx_cmd_len_status {
+	CDX_CMD_LEN_OK,
+	CDX_CMD_LEN_BAD,
+	CDX_CMD_LEN_UNKNOWN,
+};
+
+enum cdx_cmd_len_type {
+	CDX_CMD_LEN_EXACT,
+	CDX_CMD_LEN_ALT_EXACT,
+	CDX_CMD_LEN_RANGE,
+};
+
+struct cdx_cmd_len_spec {
+	U16 fcode;
+	U16 len;
+	U16 len2;
+	enum cdx_cmd_len_type type;
+};
+
+struct cdx_tx_enable_mac_cmd {
+	U16 portid;
+	U8 reserved[12];
+	U8 mac_addr[6];
+} __attribute__((__packed__));
+
+struct cdx_l2_bridge_add_entry_cmd {
+	U16 input_interface;
+	U16 input_svlan;
+	U16 input_cvlan;
+	U8 destaddr[6];
+	U8 srcaddr[6];
+	U16 ethertype;
+	U16 output_interface;
+	U16 output_svlan;
+	U16 output_cvlan;
+	U16 pkt_priority;
+	U16 svlan_priority;
+	U16 cvlan_priority;
+	U8 input_name[IF_NAME_SIZE];
+	U8 output_name[IF_NAME_SIZE];
+	U16 queue_modifier;
+	U16 session_id;
+} __attribute__((__packed__));
+
+struct cdx_l2_bridge_remove_entry_cmd {
+	U16 input_interface;
+	U16 input_svlan;
+	U16 input_cvlan;
+	U8 destaddr[6];
+	U8 srcaddr[6];
+	U16 ethertype;
+	U16 session_id;
+	U16 reserved;
+	U8 input_name[IF_NAME_SIZE];
+} __attribute__((__packed__));
+
+struct cdx_stat_action_pad_cmd {
+	U16 action;
+	U16 pad;
+} __attribute__((__packed__));
+
+struct cdx_ingress_policer_reset_cmd {
+	U16 reserved1;
+	U16 reserved2;
+} __attribute__((__packed__));
+
+struct cdx_ipr_statistics_cmd {
+	U16 ackstats;
+	struct ip_reassembly_info info;
+};
+
+#define CDX_CMD_LEN(_fcode, _type) \
+	{ .fcode = (_fcode), .len = sizeof(_type), .type = CDX_CMD_LEN_EXACT }
+#define CDX_CMD_LEN_BYTES(_fcode, _len) \
+	{ .fcode = (_fcode), .len = (_len), .type = CDX_CMD_LEN_EXACT }
+#define CDX_CMD_LEN_ALT(_fcode, _type1, _type2) \
+	{ .fcode = (_fcode), .len = sizeof(_type1), .len2 = sizeof(_type2), .type = CDX_CMD_LEN_ALT_EXACT }
+#define CDX_CMD_LEN_RANGE(_fcode, _min, _max) \
+	{ .fcode = (_fcode), .len = (_min), .len2 = (_max), .type = CDX_CMD_LEN_RANGE }
+
+static const struct cdx_cmd_len_spec cdx_cmd_len_specs[] = {
+	CDX_CMD_LEN(CMD_RX_ENABLE, U16),
+	CDX_CMD_LEN(CMD_RX_DISABLE, U16),
+	CDX_CMD_LEN(CMD_RX_LRO, U16),
+
+	CDX_CMD_LEN(CMD_RX_L2BRIDGE_ENABLE, L2BridgeEnableCommand),
+	CDX_CMD_LEN(CMD_RX_L2BRIDGE_ADD, struct cdx_l2_bridge_add_entry_cmd),
+	CDX_CMD_LEN(CMD_RX_L2BRIDGE_REMOVE, struct cdx_l2_bridge_remove_entry_cmd),
+	CDX_CMD_LEN_BYTES(CMD_RX_L2BRIDGE_QUERY_STATUS, 0),
+	CDX_CMD_LEN_BYTES(CMD_RX_L2BRIDGE_QUERY_ENTRY, 0),
+	CDX_CMD_LEN(CMD_RX_L2BRIDGE_FLOW_ENTRY, L2BridgeL2FlowEntryCommand),
+	CDX_CMD_LEN(CMD_RX_L2BRIDGE_MODE, L2BridgeControlCommand),
+	CDX_CMD_LEN(CMD_RX_L2BRIDGE_FLOW_TIMEOUT, L2BridgeControlCommand),
+	CDX_CMD_LEN_BYTES(CMD_RX_L2BRIDGE_FLOW_RESET, 0),
+	CDX_CMD_LEN(CMD_BRIDGED_ITF_UPDATE, BridgedItfCommand),
+
+	CDX_CMD_LEN(CMD_QM_RESET, QosResetCommand),
+	CDX_CMD_LEN(CMD_QM_QOSENABLE, QosEnableCommand),
+	CDX_CMD_LEN(CMD_QM_SHAPER_CONFIG, QosShaperConfigCommand),
+	CDX_CMD_LEN(CMD_QM_WBFQ_CONFIG, QosWbfqConfigCommand),
+	CDX_CMD_LEN(CMD_QM_CQ_CONFIG, QosCqConfigCommand),
+	CDX_CMD_LEN(CMD_QM_CHNL_ASSIGN, QosChnlAssignCommand),
+	CDX_CMD_LEN(CMD_QM_DSCP_Q_MAP_STATUS, QosDscpChnlClsq_mapCmd),
+	CDX_CMD_LEN(CMD_QM_DSCP_Q_MAP_CFG, QosDscpChnlClsq_mapCmd),
+	CDX_CMD_LEN(CMD_QM_DSCP_Q_MAP_RESET, QosDscpChnlClsq_mapCmd),
+	CDX_CMD_LEN(CMD_QM_EXPT_RATE, QosExptRateCommand),
+	CDX_CMD_LEN(CMD_QM_FF_RATE, QosFFRateCommand),
+	CDX_CMD_LEN(CMD_QM_QUERY, QosQueryCmd),
+	CDX_CMD_LEN(CMD_QM_QUERY_QUEUE, QosCqQueryCmd),
+	CDX_CMD_LEN(CMD_QM_QUERY_FF_RATE, QosFFRateCommand),
+	CDX_CMD_LEN(CMD_QM_QUERY_EXPT_RATE, QosExptRateCommand),
+	CDX_CMD_LEN(CMD_QM_QUERY_IFACE_DSCP_FQID_MAP, QosIfaceDscpFqidMapCommand),
+	CDX_CMD_LEN(CMD_QM_INGRESS_POLICER_ENABLE, IngressQosEnableCommand),
+	CDX_CMD_LEN(CMD_QM_INGRESS_POLICER_CONFIG, IngressQosCfgCommand),
+	CDX_CMD_LEN(CMD_QM_INGRESS_POLICER_RESET, struct cdx_ingress_policer_reset_cmd),
+	CDX_CMD_LEN(CMD_QM_INGRESS_POLICER_QUERY_STATS, IngressQosStatCmd),
+#ifdef SEC_PROFILE_SUPPORT
+	CDX_CMD_LEN(CMD_QM_SEC_POLICER_CONFIG, QosSecRateCommand),
+	CDX_CMD_LEN(CMD_QM_SEC_POLICER_QUERY_STATS, SecQosStatCmd),
+	CDX_CMD_LEN(CMD_QM_SEC_POLICER_RESET, struct cdx_ingress_policer_reset_cmd),
+#endif
+
+	CDX_CMD_LEN_ALT(CMD_IPV4_CONNTRACK, CtCommand, CtExCommand),
+	CDX_CMD_LEN(CMD_IP_ROUTE, RtCommand),
+	CDX_CMD_LEN_BYTES(CMD_IPV4_RESET, 0),
+	CDX_CMD_LEN(CMD_IPV4_SET_TIMEOUT, TimeoutCommand),
+	CDX_CMD_LEN(CMD_IPV4_GET_TIMEOUT, CtCommand),
+	CDX_CMD_LEN(CMD_IPV4_FF_CONTROL, FFControlCommand),
+	CDX_CMD_LEN(CMD_IPV4_SOCK_OPEN, SockOpenCommand),
+	CDX_CMD_LEN(CMD_IPV4_SOCK_CLOSE, SockCloseCommand),
+	CDX_CMD_LEN(CMD_IPV4_SOCK_UPDATE, SockUpdateCommand),
+
+	CDX_CMD_LEN_ALT(CMD_IPV6_CONNTRACK, CtCommandIPv6, CtExCommandIPv6),
+	CDX_CMD_LEN_BYTES(CMD_IPV6_RESET, 0),
+	CDX_CMD_LEN(CMD_IPV6_GET_TIMEOUT, CtCommandIPv6),
+	CDX_CMD_LEN(CMD_IPV6_SOCK_OPEN, Sock6OpenCommand),
+	CDX_CMD_LEN(CMD_IPV6_SOCK_CLOSE, Sock6CloseCommand),
+	CDX_CMD_LEN(CMD_IPV6_SOCK_UPDATE, Sock6UpdateCommand),
+
+	CDX_CMD_LEN_ALT(CMD_TX_ENABLE, U16, struct cdx_tx_enable_mac_cmd),
+	CDX_CMD_LEN(CMD_TX_DISABLE, U16),
+	CDX_CMD_LEN(CMD_PORT_UPDATE, PortUpdateCommand),
+	CDX_CMD_LEN(CMD_TX_DSCP_VLANPCP_MAP_STATUS, DSCPVlanPCPMapCmd),
+	CDX_CMD_LEN(CMD_TX_DSCP_VLANPCP_MAP_CFG, DSCPVlanPCPMapCmd),
+	CDX_CMD_LEN(CMD_TX_QUERY_IFACE_DSCP_VLANPCP_MAP, QueryDSCPVlanPCPMapCmd),
+
+	CDX_CMD_LEN(CMD_PPPOE_ENTRY, PPPoECommand),
+	CDX_CMD_LEN(CMD_PPPOE_RELAY_ENTRY, PPPoERelayCommand),
+	CDX_CMD_LEN(CMD_PPPOE_GET_IDLE, PPPoEIdleTimeCmd),
+
+	CDX_CMD_LEN_RANGE(CMD_MC4_MULTICAST, MC4_MIN_COMMAND_SIZE, sizeof(MC4Command)),
+	CDX_CMD_LEN_RANGE(CMD_MC6_MULTICAST, MC6_MIN_COMMAND_SIZE, sizeof(MC6Command)),
+
+	CDX_CMD_LEN(CMD_RTP_OPEN, RTPOpenCommand),
+	CDX_CMD_LEN(CMD_RTP_UPDATE, RTPOpenCommand),
+	CDX_CMD_LEN(CMD_RTP_TAKEOVER, RTPTakeoverCommand),
+	CDX_CMD_LEN(CMD_RTP_CONTROL, RTPControlCommand),
+	CDX_CMD_LEN(CMD_RTP_SPECTX_PLD, RTPSpecTxPayloadCommand),
+	CDX_CMD_LEN(CMD_RTP_SPECTX_CTRL, RTPSpecTxCtrlCommand),
+	CDX_CMD_LEN(CMD_RTCP_QUERY, RTCPQueryCommand),
+	CDX_CMD_LEN(CMD_RTP_CLOSE, RTPCloseCommand),
+	CDX_CMD_LEN(CMD_RTP_STATS_DTMF_PT, RTP_DTMF_PT_COMMAND),
+	CDX_CMD_LEN_BYTES(CMD_VOICE_BUFFER_RESET, 0),
+
+	CDX_CMD_LEN(CMD_VLAN_ENTRY, VlanCommand),
+	CDX_CMD_LEN_BYTES(CMD_VLAN_ENTRY_RESET, 0),
+
+	CDX_CMD_LEN(CMD_TNL_CREATE, TNLCommand_create),
+	CDX_CMD_LEN(CMD_TNL_DELETE, TNLCommand_delete),
+	CDX_CMD_LEN(CMD_TNL_UPDATE, TNLCommand_create),
+	CDX_CMD_LEN(CMD_TNL_QUERY, TNLCommand_query),
+	CDX_CMD_LEN(CMD_TNL_QUERY_CONT, TNLCommand_query),
+
+	CDX_CMD_LEN(CMD_STAT_ENABLE, StatEnableCmd),
+	CDX_CMD_LEN(CMD_STAT_INTERFACE_PKT, StatInterfaceCmd),
+	CDX_CMD_LEN(CMD_STAT_CONN, struct cdx_stat_action_pad_cmd),
+	CDX_CMD_LEN(CMD_STAT_PPPOE_STATUS, struct cdx_stat_action_pad_cmd),
+	CDX_CMD_LEN_BYTES(CMD_STAT_PPPOE_ENTRY, 0),
+	CDX_CMD_LEN(CMD_STAT_BRIDGE_STATUS, struct cdx_stat_action_pad_cmd),
+	CDX_CMD_LEN_BYTES(CMD_STAT_BRIDGE_ENTRY, 0),
+	CDX_CMD_LEN(CMD_STAT_VLAN_STATUS, struct cdx_stat_action_pad_cmd),
+	CDX_CMD_LEN_BYTES(CMD_STAT_VLAN_ENTRY, 0),
+	CDX_CMD_LEN(CMD_STAT_TUNNEL_STATUS, StatTunnelStatusCmd),
+	CDX_CMD_LEN_BYTES(CMD_STAT_TUNNEL_ENTRY, 0),
+	CDX_CMD_LEN(CMD_STAT_FLOW, StatFlowStatusCmd),
+	CDX_CMD_LEN(FPP_CMD_IPR_V4_STATS, struct cdx_ipr_statistics_cmd),
+	CDX_CMD_LEN(FPP_CMD_IPR_V6_STATS, struct cdx_ipr_statistics_cmd),
+
+	CDX_CMD_LEN(CMD_NATPT_OPEN, NATPTOpenCommand),
+	CDX_CMD_LEN(CMD_NATPT_CLOSE, NATPTCloseCommand),
+	CDX_CMD_LEN(CMD_NATPT_QUERY, NATPTQueryCommand),
+
+#ifdef CFG_WIFI_OFFLOAD
+	CDX_CMD_LEN(CMD_WIFI_VAP_ENTRY, struct wifiCmd),
+	CDX_CMD_LEN_BYTES(CMD_WIFI_VAP_QUERY, 0),
+	CDX_CMD_LEN_BYTES(CMD_WIFI_VAP_RESET, 0),
+#endif
+};
+
+static enum cdx_cmd_len_status cdx_validate_cmd_length(U16 fcode, U16 length)
+{
+	size_t ii;
+
+	for (ii = 0; ii < ARRAY_SIZE(cdx_cmd_len_specs); ii++) {
+		const struct cdx_cmd_len_spec *spec = &cdx_cmd_len_specs[ii];
+
+		if (spec->fcode != fcode)
+			continue;
+
+		switch (spec->type) {
+		case CDX_CMD_LEN_EXACT:
+			return (length == spec->len) ? CDX_CMD_LEN_OK : CDX_CMD_LEN_BAD;
+		case CDX_CMD_LEN_ALT_EXACT:
+			return (length == spec->len || length == spec->len2) ?
+				CDX_CMD_LEN_OK : CDX_CMD_LEN_BAD;
+		case CDX_CMD_LEN_RANGE:
+			return (length >= spec->len && length <= spec->len2) ?
+				CDX_CMD_LEN_OK : CDX_CMD_LEN_BAD;
+		}
+	}
+
+	return CDX_CMD_LEN_UNKNOWN;
+}
 
 int FCODE_TO_EVENT(U32 fcode)
 {
@@ -79,6 +318,7 @@ int cdx_cmd_handler(U16 fcode, U16 length, U16 *payload, U16 *rlen, U16 *rbuf, U
 {
 	CmdProc cmdproc;
 	int eventid;
+	enum cdx_cmd_len_status len_status;
 
 	if (!rlen || !rbuf || (length && !payload))
 		return -EINVAL;
@@ -86,6 +326,8 @@ int cdx_cmd_handler(U16 fcode, U16 length, U16 *payload, U16 *rlen, U16 *rbuf, U
 	*rlen = 0;
 	if (rbuf_len < sizeof(U16))
 		return -EMSGSIZE;
+
+	memset(rbuf, 0, rbuf_len);
 
 	if (length > rbuf_len)
 		return -EMSGSIZE;
@@ -95,6 +337,12 @@ int cdx_cmd_handler(U16 fcode, U16 length, U16 *payload, U16 *rlen, U16 *rbuf, U
 	DPRINT("fcode=0x%04x, length=%d\n", fcode, length);
 	print_hex_dump(KERN_DEBUG, "cmd: ", DUMP_PREFIX_NONE, 16, 1, payload, length, 1);
 #endif
+	len_status = cdx_validate_cmd_length(fcode, length);
+	if (len_status == CDX_CMD_LEN_BAD) {
+		rbuf[0] = ERR_WRONG_COMMAND_SIZE;
+		*rlen = 2;
+		goto out;
+	}
 /////////////////////////////////////////////////////////////////////////////
 	// TEMP code to satisfy CMM
 	if (fcode == CMD_VOICE_BUFFER_RESET)
@@ -106,7 +354,13 @@ int cdx_cmd_handler(U16 fcode, U16 length, U16 *payload, U16 *rlen, U16 *rbuf, U
 /////////////////////////////////////////////////////////////////////////////
 	if (eventid >= 0 && (cmdproc = gCmdProcTable[eventid]) != NULL)
 	{
-		memcpy(rbuf, payload, length);
+		if (len_status == CDX_CMD_LEN_UNKNOWN) {
+			rbuf[0] = ERR_UNKNOWN_COMMAND;
+			*rlen = 2;
+			goto out;
+		}
+		if (length)
+			memcpy(rbuf, payload, length);
 		*rlen = (*cmdproc)(fcode, length, rbuf);
 		if (*rlen == 0)
 		{
@@ -122,6 +376,7 @@ int cdx_cmd_handler(U16 fcode, U16 length, U16 *payload, U16 *rlen, U16 *rbuf, U
 	if (rbuf[0] != NO_ERR)
 		DPRINT("rbuf[0]=0x%04x, *rlen=%d\n", rbuf[0], *rlen);
 
+out:
 	if (*rlen > rbuf_len)
 		return -EMSGSIZE;
 
