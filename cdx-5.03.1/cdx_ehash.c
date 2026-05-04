@@ -3169,22 +3169,44 @@ static ssize_t stats_read(struct file *file, char __user *buf, size_t size, loff
 {
 	int  tot_len = 0;
 	cdx_ucode_frag_info_t  *ucode_frag_args;
+	char *kbuf;
+	ssize_t ret;
 
-	if (!create_ddr_and_copy_from_muram((void *)frag_info_g.muram_frag_params, (void **)&ucode_frag_args, sizeof(cdx_ucode_frag_info_t)))
-		return 0;
-	
 	if (*ppos)
 		return 0;
 
-	tot_len += sprintf(buf+tot_len, "IPv4 frames received : %u\n", be32_to_cpu(ucode_frag_args->v4_frames_counter));
-	tot_len += sprintf(buf+tot_len, "IPv6 frames received : %u\n", be32_to_cpu(ucode_frag_args->v6_frames_counter));
-	tot_len += sprintf(buf+tot_len, "Number of IPv4 fragments sent : %u\n", be32_to_cpu(ucode_frag_args->v4_frags_counter));
-	tot_len += sprintf(buf+tot_len, "Number of IPv6 fragments sent : %u\n", be32_to_cpu(ucode_frag_args->v6_frags_counter));
-	tot_len += sprintf(buf+tot_len, "Failures in allocating buffers: %u\n", be32_to_cpu(ucode_frag_args->alloc_buff_failures));
-	*ppos += tot_len;
+	if (!create_ddr_and_copy_from_muram((void *)frag_info_g.muram_frag_params,
+					    (void **)&ucode_frag_args,
+					    sizeof(cdx_ucode_frag_info_t)))
+		return 0;
 
+	kbuf = kzalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!kbuf) {
+		kfree(ucode_frag_args);
+		return -ENOMEM;
+	}
+
+	tot_len += scnprintf(kbuf + tot_len, PAGE_SIZE - tot_len,
+			     "IPv4 frames received : %u\n",
+			     be32_to_cpu(ucode_frag_args->v4_frames_counter));
+	tot_len += scnprintf(kbuf + tot_len, PAGE_SIZE - tot_len,
+			     "IPv6 frames received : %u\n",
+			     be32_to_cpu(ucode_frag_args->v6_frames_counter));
+	tot_len += scnprintf(kbuf + tot_len, PAGE_SIZE - tot_len,
+			     "Number of IPv4 fragments sent : %u\n",
+			     be32_to_cpu(ucode_frag_args->v4_frags_counter));
+	tot_len += scnprintf(kbuf + tot_len, PAGE_SIZE - tot_len,
+			     "Number of IPv6 fragments sent : %u\n",
+			     be32_to_cpu(ucode_frag_args->v6_frags_counter));
+	tot_len += scnprintf(kbuf + tot_len, PAGE_SIZE - tot_len,
+			     "Failures in allocating buffers: %u\n",
+			     be32_to_cpu(ucode_frag_args->alloc_buff_failures));
+
+	ret = simple_read_from_buffer(buf, size, ppos, kbuf, tot_len);
+
+	kfree(kbuf);
 	kfree(ucode_frag_args);
-	return tot_len;
+	return ret;
 }
 
 

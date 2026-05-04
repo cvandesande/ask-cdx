@@ -114,7 +114,9 @@ int cdx_ipsec_sync_shared_desc_for_device(void *handle);
 int cdx_ipsec_sa_set_compat_tx(void *handle, uint32_t channel, uint32_t wq);
 int cdx_ipsec_sa_set_compat_l2(void *handle, const uint8_t *hdr, uint8_t len,
 		uint8_t pppoe_off);
+int cdx_ipsec_sa_set_compat_tx_dev(void *handle, struct net_device *dev);
 int cdx_ipsec_sa_set_compat_lan_dev(void *handle, struct net_device *dev);
+int cdx_ipsec_sa_set_compat_mtu(void *handle, uint16_t mtu);
 
 struct qman_fq *get_to_sec_fq(void *handle);
 struct qman_fq *get_from_sec_fq(void *handle);

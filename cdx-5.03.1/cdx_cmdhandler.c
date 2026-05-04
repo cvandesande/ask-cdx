@@ -13,6 +13,10 @@
 #include "control_stat.h"
 #include "control_tunnel.h"
 #include "control_tx.h"
+#ifdef DPA_IPSEC_OFFLOAD
+#include "control_ipsec.h"
+#include "cdx_dpa_ipsec.h"
+#endif
 #include "control_vlan.h"
 #include "dpa_control_mc.h"
 #include "fm_ehash.h"
@@ -285,6 +289,23 @@ static const struct cdx_cmd_len_spec cdx_cmd_len_specs[] = {
 	CDX_CMD_LEN(CMD_TNL_QUERY, TNLCommand_query),
 	CDX_CMD_LEN(CMD_TNL_QUERY_CONT, TNLCommand_query),
 
+#ifdef DPA_IPSEC_OFFLOAD
+	CDX_CMD_LEN(CMD_IPSEC_SA_CREATE, CommandIPSecCreateSA),
+	CDX_CMD_LEN(CMD_IPSEC_SA_DELETE, CommandIPSecDeleteSA),
+	CDX_CMD_LEN_BYTES(CMD_IPSEC_SA_FLUSH, 0),
+	CDX_CMD_LEN(CMD_IPSEC_SA_SET_KEYS, CommandIPSecSetKey),
+	CDX_CMD_LEN(CMD_IPSEC_SA_SET_TUNNEL, CommandIPSecSetTunnel),
+	CDX_CMD_LEN(CMD_IPSEC_SA_SET_NATT, CommandIPSecSetNatt),
+	CDX_CMD_LEN(CMD_IPSEC_SA_SET_STATE, CommandIPSecSetState),
+	CDX_CMD_LEN(CMD_IPSEC_SA_SET_LIFETIME, CommandIPSecSetLifetime),
+	CDX_CMD_LEN(CMD_IPSEC_SA_ACTION_QUERY, SAQueryCommand),
+	CDX_CMD_LEN(CMD_IPSEC_SA_ACTION_QUERY_CONT, SAQueryCommand),
+	CDX_CMD_LEN(CMD_IPSEC_FRAG_CFG, CommandIPSecSetPreFrag),
+	CDX_CMD_LEN(CMD_IPSEC_SA_SET_TNL_ROUTE, CommandIPSecSetTunnelRoute),
+	CDX_CMD_LEN(CMD_IPSEC_SEC_FAILURE_STATS, fpp_sec_failure_stats_query_cmd_t),
+	CDX_CMD_LEN(CMD_IPSEC_RESET_SEC_FAILURE_STATS, fpp_sec_failure_stats_query_cmd_t),
+#endif
+
 	CDX_CMD_LEN(CMD_STAT_ENABLE, StatEnableCmd),
 	CDX_CMD_LEN(CMD_STAT_INTERFACE_PKT, StatInterfaceCmd),
 	CDX_CMD_LEN(CMD_STAT_CONN, struct cdx_stat_action_pad_cmd),
@@ -500,7 +521,7 @@ CMD_DECLARE(bridge)
 CMD_DECLARE(qm)
 CMD_DECLARE(statistics)
 #ifdef DPA_IPSEC_OFFLOAD 
-CMD_DECLARE(ipsec)
+static BOOL ipsec_init_flag = 0;
 #endif
 #ifdef WIFI_ENABLE
 CMD_DECLARE(wifi)

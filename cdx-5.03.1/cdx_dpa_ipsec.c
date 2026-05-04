@@ -186,6 +186,8 @@ int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info)
 				sa->pSec_sa_context->to_sec_fqid;
 				info->sa_family = sa->family ;
 				info->tnl_hdr_size = (sa->dev_mtu - sa->mtu); /* Gives you the header expansion size */
+				if (sa->mtu)
+					info->l2_info.mtu = sa->mtu;
 #ifdef CDX_DPA_DEBUG	
 				printk(KERN_CRIT "%s OutBound SA info->to_sec_fqid  = %d\n", __func__,info->to_sec_fqid );
 #endif				
@@ -2499,6 +2501,11 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 		goto err_ret;
 	}
 
+	if (sa->mtu)
+		cdx_ipsec_sa_set_compat_mtu(
+				sa->pSec_sa_context->dpa_ipsecsa_handle,
+				sa->mtu);
+
 	//get portand table info
 	if(sa->direction == CDX_DPA_IPSEC_INBOUND)
 	{
@@ -2620,25 +2627,36 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 			DPA_ERROR("%s:: failed to configure compat tx queue\n", __FUNCTION__);
 			goto err_ret;
 		}
+		if (cdx_ipsec_sa_set_compat_tx_dev(
+					sa->pSec_sa_context->dpa_ipsecsa_handle,
+					(struct net_device *)sa->netdev)) {
+			printk(KERN_WARNING
+				"IPSEC_COMPAT_BIND: stage=outbound-tx-dev-skip sa_handle=0x%x netdev=%p\n",
+				sa->handle, sa->netdev);
+		}
 
 		/* Build L2 header template for compat path.
 		 * CAAM returns bare IP/ESP. FMAN TX needs a complete Ethernet
 		 * frame. The compat path bypasses the offline-port HM opcode
-		 * chain that would normally prepend L2 headers, so we build
-		 * them here at SA creation time (all fields are constant
-		 * except PPPoE payload length which is patched per-packet). */
+		 * chain that would normally prepend L2 headers, so prepend only
+		 * L2 here. CAAM emits the outer IP header from the IPsec PDB. */
 		{
-			uint8_t l2buf[32];
+			uint8_t l2buf[96];
 			uint8_t l2len = 0;
 			uint8_t pppoe_off = 0;
 			struct dpa_l2hdr_info *l2 = &info->l2_info;
-			uint16_t vlan_id = 0;
+			uint16_t vlan_tci = 0;
 			uint16_t pppoe_sid = 0;
 
 			if (l2->num_egress_vlan_hdrs > 0)
-				vlan_id = l2->egress_vlan_hdrs[0].tci & 0xfff;
-			if (l2->add_pppoe_hdr)
-				pppoe_sid = l2->pppoe_sess_id;
+				vlan_tci = l2->egress_vlan_hdrs[0].tci;
+			if (l2->add_pppoe_hdr) {
+				/* devman stores PPPoE session IDs as on-wire
+				 * values.  Match create_pppoe_ins_hm(): convert
+				 * before writing bytes into the compat L2 header.
+				 */
+				pppoe_sid = ntohs(l2->pppoe_sess_id);
+			}
 
 			/* Ethernet dst MAC: use AC MAC for PPPoE, else
 			 * routing next-hop from l2hdr[0..5].
@@ -2650,11 +2668,11 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 			memcpy(l2buf + 6, l2->l2hdr + 6, 6);
 			l2len = 12;
 
-			if (vlan_id) {
+			if (vlan_tci) {
 				l2buf[l2len++] = 0x81;
 				l2buf[l2len++] = 0x00;
-				l2buf[l2len++] = (vlan_id >> 8) & 0xff;
-				l2buf[l2len++] = vlan_id & 0xff;
+				l2buf[l2len++] = (vlan_tci >> 8) & 0xff;
+				l2buf[l2len++] = vlan_tci & 0xff;
 			}
 
 			if (pppoe_sid) {

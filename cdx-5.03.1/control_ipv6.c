@@ -14,6 +14,34 @@
 #include "control_socket.h"
 #include "control_ipsec.h"
 
+#ifdef DPA_IPSEC_OFFLOAD
+static int ipsec_ct6_needs_rebuild(PCtEntry entry, int secure,
+		U16 *sa_handle, U8 sa_nr)
+{
+	if (((entry->status & CONNTRACK_SEC) != 0) != (secure != 0))
+		return 1;
+
+	if (!secure)
+		return 0;
+
+	(void)sa_handle;
+	(void)sa_nr;
+	return 1;
+}
+
+static int ipsec_rebuild_ct6_if_needed(PCtEntry entry, const char *dir,
+		int secure, U16 *sa_handle, U8 sa_nr)
+{
+	if (!entry || !(entry->status & CONNTRACK_HWSET))
+		return 0;
+
+	if (!ipsec_ct6_needs_rebuild(entry, secure, sa_handle, sa_nr))
+		return 0;
+
+	return delete_entry_from_classif_table(entry);
+}
+#endif
+
 static int ipv6_cmp_aligned(void *src, void *dst)
 {
 	u32 off = 0;
@@ -434,6 +462,23 @@ static int IPv6_handle_CONNTRACK(U16 *p, U16 Length)
 						if (M_ipsec_sa_cache_lookup_by_h(Ctcmd.SAReply_handle[i]) == NULL)
 							return ERR_CT_ENTRY_INVALID_SA;
 				}
+
+				if (ipsec_rebuild_ct6_if_needed(pEntry_orig, "orig", 1,
+							Ctcmd.SA_handle, Ctcmd.SA_nr))
+					return ERR_CREATION_FAILED;
+
+				if (ipsec_rebuild_ct6_if_needed(pEntry_rep, "reply", 1,
+							Ctcmd.SAReply_handle,
+							Ctcmd.SAReply_nr))
+					return ERR_CREATION_FAILED;
+			} else {
+				if (ipsec_rebuild_ct6_if_needed(pEntry_orig, "orig", 0,
+							Ctcmd.SA_handle, 0))
+					return ERR_CREATION_FAILED;
+
+				if (ipsec_rebuild_ct6_if_needed(pEntry_rep, "reply", 0,
+							Ctcmd.SAReply_handle, 0))
+					return ERR_CREATION_FAILED;
 			}
 #endif
 			pEntry_orig->qosmark.markval = get_ctentry_qosmark_from_qosconnmark(Ctcmd.qosconnmark, CONN_ORIG);

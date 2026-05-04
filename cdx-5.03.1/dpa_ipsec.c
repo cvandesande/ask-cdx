@@ -19,11 +19,19 @@
 #include <linux/etherdevice.h>
 #include <linux/if_ether.h>
 #include <linux/if_arp.h>
+#include <linux/if_bridge.h>
+#include <linux/if_vlan.h>
+#include <linux/rtnetlink.h>
+#include <linux/jhash.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
+#include <net/ip.h>
+#include <net/checksum.h>
 #include <linux/netfilter_ipv6.h>
 #include <linux/netfilter_bridge.h>
 #include <linux/irqnr.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
 #include <linux/ppp_defs.h>
 #include <linux/highmem.h>
 #include <linux/proc_fs.h>
@@ -115,15 +123,17 @@ struct dpa_ipsec_sainfo {
 	struct dpa_fq compat_tx_fq;
 	uint32_t compat_tx_channel;
 	uint32_t compat_tx_wq;
+	struct net_device *compat_tx_dev;
 	uint16_t peer_sa_handle;
 	uint32_t fromsec_last_status;
 	atomic64_t fromsec_status_transition_cnt;
 	atomic64_t fromsec_bad_50000008_cnt;
 	atomic64_t fromsec_bad_50000008_runlen;
-	uint8_t compat_l2_hdr[32];
+	uint8_t compat_l2_hdr[96];
 	uint8_t compat_l2_len;
 	uint8_t compat_l2_pppoe_off;
 	struct net_device *compat_lan_dev;
+	uint16_t compat_mtu;
 	void *sa_proc_entry;
 };
 
@@ -257,6 +267,16 @@ module_param(ipsec_compat_reinject_mode, uint, 0644);
 MODULE_PARM_DESC(ipsec_compat_reinject_mode,
 	"0=disabled, 1=enable native OH-port reinjection for no-compat-TX returns (default)");
 
+static bool ipsec_compat_learning_punt = true;
+module_param(ipsec_compat_learning_punt, bool, 0644);
+MODULE_PARM_DESC(ipsec_compat_learning_punt,
+	"Punt first inbound decrypted TCP/UDP packet per inner flow to Linux for conntrack learning");
+
+static bool ipsec_compat_txdev_prefer = true;
+module_param(ipsec_compat_txdev_prefer, bool, 0644);
+MODULE_PARM_DESC(ipsec_compat_txdev_prefer,
+	"Prefer normal DPAA netdev TX for post-SEC compat frames when an SA TX device is known");
+
 static bool ipsec_reinject_snapshot_enable = false;
 module_param(ipsec_reinject_snapshot_enable, bool, 0644);
 MODULE_PARM_DESC(ipsec_reinject_snapshot_enable,
@@ -305,7 +325,28 @@ static atomic64_t ipsec_excp_status_bucket_cnt[16];
 static atomic64_t ipsec_reinject_status_bucket_cnt[16];
 static atomic64_t ipsec_from_sec_entry_cnt = ATOMIC64_INIT(0);
 static atomic64_t ipsec_from_sec_format_cnt[4];
+static atomic64_t ipsec_learning_punt_cnt = ATOMIC64_INIT(0);
+static atomic64_t ipsec_learning_seen_cnt = ATOMIC64_INIT(0);
+static atomic64_t ipsec_learning_skip_cnt = ATOMIC64_INIT(0);
 static atomic64_t ipsec_from_sec_status_bucket_cnt[16];
+
+enum ipsec_bp_site {
+	IPSEC_BP_SGLIST,
+	IPSEC_BP_PAYLOAD,
+	IPSEC_BP_REBUILD,
+	IPSEC_BP_SITE_MAX,
+};
+
+static atomic64_t ipsec_bp_alloc_ok_cnt[IPSEC_BP_SITE_MAX];
+static atomic64_t ipsec_bp_alloc_enobufs_cnt[IPSEC_BP_SITE_MAX];
+static atomic64_t ipsec_bp_alloc_fail_cnt[IPSEC_BP_SITE_MAX];
+static atomic64_t ipsec_bp_release_sg_payload_cnt = ATOMIC64_INIT(0);
+static atomic64_t ipsec_bp_release_rebuild_old_cnt = ATOMIC64_INIT(0);
+static atomic64_t ipsec_bp_release_compat_cnt = ATOMIC64_INIT(0);
+static atomic64_t ipsec_bp_release_ern_cnt = ATOMIC64_INIT(0);
+static atomic64_t ipsec_bp_txdev_enqueue_ok_cnt = ATOMIC64_INIT(0);
+static atomic64_t ipsec_bp_compat_enqueue_ok_cnt = ATOMIC64_INIT(0);
+static atomic64_t ipsec_bp_enqueue_fail_cnt = ATOMIC64_INIT(0);
 
 /* Keep success-path diagnostics off by default to avoid dmesg overhead. */
 static bool ipsec_compat_diag_enable = false;
@@ -334,7 +375,6 @@ static atomic64_t ipsec_cgr_enter_cnt = ATOMIC64_INIT(0);
 static atomic64_t ipsec_cgr_exit_cnt = ATOMIC64_INIT(0);
 #endif
 
-#define IPSEC_DBG_DPOVRD_MASK 0x80000000
 #define IPSEC_DEBUG_HELPERS 0
 
 static inline bool ipsec_compat_diag_should_log(u64 v)
@@ -354,6 +394,7 @@ static inline bool ipsec_dbg_sa_match(uint16_t sa)
 #define IPSEC_ST_ERR_LENGTH		0x02000000
 #define IPSEC_ST_ERR_DMA			0x01000000
 #define IPSEC_ST_ERR_NON_FM		0x00400000
+#define IPSEC_COMPAT_MAX_SG_ENTRIES	64
 
 static void ipsec_dbg_log_status(const char *stage, uint16_t sa, uint32_t st)
 {
@@ -697,6 +738,56 @@ static inline uint8_t ipsec_status_bucket(uint32_t st)
 	return (uint8_t)((st >> 28) & 0xf);
 }
 
+static bool ipsec_fd_from_ipsec_bp(const struct qm_fd *fd)
+{
+	return fd && ipsecinfo.ipsec_bp &&
+		fd->bpid == ipsecinfo.ipsec_bp->bpid;
+}
+
+static void ipsec_bp_note_alloc(unsigned int site, int err)
+{
+	if (site >= IPSEC_BP_SITE_MAX)
+		return;
+
+	if (!err)
+		atomic64_inc(&ipsec_bp_alloc_ok_cnt[site]);
+	else if (err == -ENOBUFS)
+		atomic64_inc(&ipsec_bp_alloc_enobufs_cnt[site]);
+	else
+		atomic64_inc(&ipsec_bp_alloc_fail_cnt[site]);
+}
+
+static void ipsec_bp_release_fd(struct qm_fd *fd, atomic64_t *counter)
+{
+	if (ipsec_fd_from_ipsec_bp(fd) && counter)
+		atomic64_inc(counter);
+
+	dpa_fd_release(NULL, fd);
+}
+
+static void ipsec_log_bp_snapshot(const char *stage)
+{
+	printk_ratelimited(KERN_INFO
+		"IPSEC_BP_SNAP: stage=%s alloc_ok[sg=%llu payload=%llu rebuild=%llu] enobufs[sg=%llu payload=%llu rebuild=%llu] fail[sg=%llu payload=%llu rebuild=%llu] release[sg_payload=%llu rebuild_old=%llu compat=%llu ern=%llu] enqueue[txdev_ok=%llu compat_ok=%llu fail=%llu]\n",
+		stage ? stage : "unknown",
+		(unsigned long long)atomic64_read(&ipsec_bp_alloc_ok_cnt[IPSEC_BP_SGLIST]),
+		(unsigned long long)atomic64_read(&ipsec_bp_alloc_ok_cnt[IPSEC_BP_PAYLOAD]),
+		(unsigned long long)atomic64_read(&ipsec_bp_alloc_ok_cnt[IPSEC_BP_REBUILD]),
+		(unsigned long long)atomic64_read(&ipsec_bp_alloc_enobufs_cnt[IPSEC_BP_SGLIST]),
+		(unsigned long long)atomic64_read(&ipsec_bp_alloc_enobufs_cnt[IPSEC_BP_PAYLOAD]),
+		(unsigned long long)atomic64_read(&ipsec_bp_alloc_enobufs_cnt[IPSEC_BP_REBUILD]),
+		(unsigned long long)atomic64_read(&ipsec_bp_alloc_fail_cnt[IPSEC_BP_SGLIST]),
+		(unsigned long long)atomic64_read(&ipsec_bp_alloc_fail_cnt[IPSEC_BP_PAYLOAD]),
+		(unsigned long long)atomic64_read(&ipsec_bp_alloc_fail_cnt[IPSEC_BP_REBUILD]),
+		(unsigned long long)atomic64_read(&ipsec_bp_release_sg_payload_cnt),
+		(unsigned long long)atomic64_read(&ipsec_bp_release_rebuild_old_cnt),
+		(unsigned long long)atomic64_read(&ipsec_bp_release_compat_cnt),
+		(unsigned long long)atomic64_read(&ipsec_bp_release_ern_cnt),
+		(unsigned long long)atomic64_read(&ipsec_bp_txdev_enqueue_ok_cnt),
+		(unsigned long long)atomic64_read(&ipsec_bp_compat_enqueue_ok_cnt),
+		(unsigned long long)atomic64_read(&ipsec_bp_enqueue_fail_cnt));
+}
+
 static void ipsec_note_nofq_remap_reason(uint8_t remap_reason)
 {
 	if (remap_reason >= IPSEC_NOFQ_REMAP_MAX)
@@ -825,6 +916,8 @@ static void ipsec_log_from_sec_snapshot(struct dpa_ipsec_sainfo *ipsecsa_info,
 				&ipsecsa_info->fromsec_bad_50000008_runlen) : 0,
 		ipsecsa_info ? READ_ONCE(ipsecsa_info->fromsec_last_status) : 0);
 
+	ipsec_log_bp_snapshot("fromsec-snapshot");
+
 	if (ipsecsa_info) {
 		ipsec_log_fq_runtime_nofilter("fromsec-fq",
 				&ipsecsa_info->sec_fq[FQ_FROM_SEC].fq_base);
@@ -877,6 +970,7 @@ static void ipsec_track_fromsec_status(struct dpa_ipsec_sainfo *ipsecsa_info,
 					&ipsecsa_info->fromsec_bad_50000008_cnt),
 				(unsigned long long)atomic64_read(
 					&ipsecsa_info->fromsec_status_transition_cnt));
+			ipsec_log_bp_snapshot("bad5-enter");
 		} else {
 			atomic64_set(&ipsecsa_info->fromsec_bad_50000008_runlen, 0);
 		}
@@ -1003,12 +1097,25 @@ static void ipsec_log_reinject_snapshot(const struct qman_fq *from_sec_fq,
 
 static void ipsec_destroy_compat_tx_fq(struct dpa_ipsec_sainfo *ipsecsa_info)
 {
+	struct qm_mcr_queryfq_np np;
 	struct qman_fq *fq;
+	int qret;
 
 	if (!ipsecsa_info || !ipsecsa_info->compat_tx_fq.fqid)
 		return;
 
 	fq = &ipsecsa_info->compat_tx_fq.fq_base;
+	memset(&np, 0, sizeof(np));
+	qret = qman_query_fq_np(fq, &np);
+	if (qret) {
+		printk_ratelimited(KERN_ERR
+			"IPSEC_COMPAT_FQ: destroy-query-failed fqid=0x%x err=%d\n",
+			fq->fqid, qret);
+	} else {
+		printk_ratelimited(KERN_INFO
+			"IPSEC_COMPAT_FQ: destroy fqid=0x%x state=%u frm_cnt=%u byte_cnt=%u\n",
+			fq->fqid, np.state, np.frm_cnt, np.byte_cnt);
+	}
 	cdx_remove_fqid_info_in_procfs(ipsecsa_info->compat_tx_fq.fqid);
 	qman_destroy_fq(fq, 0);
 	memset(&ipsecsa_info->compat_tx_fq, 0,
@@ -1375,6 +1482,234 @@ static struct dpa_ipsec_sainfo *ipsec_resolve_compat_remap_peer(
 	return peer_ipsecsa_info;
 }
 
+#define IPSEC_LEARN_FLOW_TABLE_SIZE 256
+#define IPSEC_LEARN_FLOW_TTL (60 * HZ)
+
+struct ipsec_learn_flow_key {
+	uint8_t family;
+	uint8_t proto;
+	__be16 sport;
+	__be16 dport;
+	__be32 addr[8];
+};
+
+struct ipsec_learn_flow_entry {
+	struct ipsec_learn_flow_key key;
+	unsigned long stamp;
+	bool valid;
+};
+
+static DEFINE_SPINLOCK(ipsec_learn_flow_lock);
+static struct ipsec_learn_flow_entry
+	ipsec_learn_flows[IPSEC_LEARN_FLOW_TABLE_SIZE];
+static uint32_t ipsec_learn_flow_next;
+
+static bool ipsec_compat_parse_inner_flow(const uint8_t *pkt, uint32_t len,
+		struct ipsec_learn_flow_key *key)
+{
+	uint8_t version;
+	uint8_t proto;
+	uint32_t l4off;
+	const struct iphdr *iph;
+
+	if (!pkt || !len || !key)
+		return false;
+
+	memset(key, 0, sizeof(*key));
+	version = pkt[0] >> 4;
+
+	if (version == 4) {
+		if (len < sizeof(*iph))
+			return false;
+
+		iph = (const struct iphdr *)pkt;
+		if (iph->version != 4 || iph->ihl < 5)
+			return false;
+
+		l4off = iph->ihl * 4;
+		if (len < l4off + 4)
+			return false;
+		if (ntohs(iph->frag_off) & (IP_MF | IP_OFFSET))
+			return false;
+
+		proto = iph->protocol;
+		if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
+			return false;
+
+		key->family = AF_INET;
+		key->proto = proto;
+		memcpy(&key->sport, pkt + l4off, sizeof(key->sport));
+		memcpy(&key->dport, pkt + l4off + 2, sizeof(key->dport));
+		key->addr[0] = iph->saddr;
+		key->addr[1] = iph->daddr;
+		return true;
+	}
+
+	if (version == 6) {
+		if (len < 44)
+			return false;
+
+		proto = pkt[6];
+		if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
+			return false;
+
+		l4off = 40;
+		key->family = AF_INET6;
+		key->proto = proto;
+		memcpy(&key->sport, pkt + l4off, sizeof(key->sport));
+		memcpy(&key->dport, pkt + l4off + 2, sizeof(key->dport));
+		memcpy(&key->addr[0], pkt + 8, 16);
+		memcpy(&key->addr[4], pkt + 24, 16);
+		return true;
+	}
+
+	return false;
+}
+
+static bool ipsec_compat_should_learning_punt(const uint8_t *pkt, uint32_t len)
+{
+	struct ipsec_learn_flow_entry *entry;
+	struct ipsec_learn_flow_key key;
+	struct ipsec_learn_flow_entry *empty = NULL;
+	unsigned long now = jiffies;
+	uint32_t idx;
+	uint32_t i;
+
+	if (!ipsec_compat_learning_punt)
+		return false;
+
+	if (!ipsec_compat_parse_inner_flow(pkt, len, &key)) {
+		atomic64_inc(&ipsec_learning_skip_cnt);
+		return false;
+	}
+
+	idx = jhash(&key, sizeof(key), 0) &
+		(IPSEC_LEARN_FLOW_TABLE_SIZE - 1);
+
+	spin_lock(&ipsec_learn_flow_lock);
+	for (i = 0; i < 4; i++) {
+		entry = &ipsec_learn_flows[
+			(idx + i) & (IPSEC_LEARN_FLOW_TABLE_SIZE - 1)];
+		if (!entry->valid || time_after(now, entry->stamp +
+		    IPSEC_LEARN_FLOW_TTL)) {
+			if (!empty)
+				empty = entry;
+			continue;
+		}
+
+		if (!memcmp(&entry->key, &key, sizeof(key))) {
+			entry->stamp = now;
+			spin_unlock(&ipsec_learn_flow_lock);
+			atomic64_inc(&ipsec_learning_seen_cnt);
+			return false;
+		}
+	}
+
+	if (!empty) {
+		empty = &ipsec_learn_flows[
+			ipsec_learn_flow_next++ &
+			(IPSEC_LEARN_FLOW_TABLE_SIZE - 1)];
+	}
+
+	empty->key = key;
+	empty->stamp = now;
+	empty->valid = true;
+	spin_unlock(&ipsec_learn_flow_lock);
+
+	atomic64_inc(&ipsec_learning_punt_cnt);
+	return true;
+}
+
+static int ipsec_compat_punt_inner_to_stack(struct dpa_ipsec_sainfo *src_info,
+		struct qm_fd *compat_fd)
+{
+	struct sec_path *sp;
+	struct sk_buff *skb = NULL;
+	struct xfrm_state *x = NULL;
+	struct net_device *net_dev;
+	struct timespec64 ktime;
+	PSAEntry src_sa;
+	uint8_t *base;
+	uint8_t *pkt;
+	uint32_t len;
+	__be16 proto;
+	uint16_t sagd;
+	int rc;
+
+	if (!src_info || !compat_fd || compat_fd->format != qm_fd_contig ||
+	    !qm_fd_addr(compat_fd) || !compat_fd->length20)
+		return -EINVAL;
+
+	src_sa = ipsec_find_src_sa_by_ipsecsa_info(src_info);
+	if (!src_sa || !src_sa->netdev || !src_sa->handle)
+		return -ENODEV;
+
+	base = (uint8_t *)phys_to_virt((uint64_t)qm_fd_addr(compat_fd));
+	if (!base)
+		return -EFAULT;
+
+	pkt = base + compat_fd->offset;
+	len = compat_fd->length20;
+	if (len < 1)
+		return -EINVAL;
+
+	if ((pkt[0] >> 4) == 4)
+		proto = htons(ETH_P_IP);
+	else if ((pkt[0] >> 4) == 6)
+		proto = htons(ETH_P_IPV6);
+	else
+		return -EPROTONOSUPPORT;
+
+	net_dev = src_sa->netdev;
+	sagd = src_sa->handle;
+
+	x = xfrm_state_lookup_byhandle(dev_net(net_dev), sagd);
+	if (!x)
+		return -ENOENT;
+
+	skb = netdev_alloc_skb_ip_align(net_dev, len);
+	if (!skb) {
+		rc = -ENOMEM;
+		goto err_put_xfrm;
+	}
+
+	skb_put_data(skb, pkt, len);
+	skb->dev = net_dev;
+	skb->skb_iif = net_dev->ifindex;
+	skb->protocol = proto;
+	skb->pkt_type = PACKET_HOST;
+	skb->ip_summed = CHECKSUM_NONE;
+	skb->csum_level = 0;
+	skb->encapsulation = 0;
+	skb_reset_mac_header(skb);
+	skb->mac_len = 0;
+	skb_reset_network_header(skb);
+	skb_probe_transport_header(skb);
+
+	sp = secpath_set(skb);
+	if (!sp) {
+		rc = -ENOMEM;
+		goto err_free_skb;
+	}
+
+	sp->xvec[sp->len++] = x;
+	if (!x->curlft.use_time) {
+		ktime_get_real_ts64(&ktime);
+		x->curlft.use_time = (unsigned long)ktime.tv_sec;
+	}
+	x = NULL;
+
+	ipsec_bp_release_fd(compat_fd, &ipsec_bp_release_compat_cnt);
+	netif_receive_skb(skb);
+	return 0;
+
+err_free_skb:
+	dev_kfree_skb(skb);
+err_put_xfrm:
+	xfrm_state_put(x);
+	return rc;
+}
+
 static int ipsec_create_compat_tx_fq(struct dpa_ipsec_sainfo *ipsecsa_info,
 		uint32_t channel, uint32_t wq, uint16_t sa_handle)
 {
@@ -1405,13 +1740,12 @@ static int ipsec_create_compat_tx_fq(struct dpa_ipsec_sainfo *ipsecsa_info,
 	opts.fqd.dest.channel = dpa_fq->channel;
 	opts.fqd.dest.wq = dpa_fq->wq;
 	opts.fqd.fq_ctrl = QM_FQCTRL_PREFERINCACHE;
-	/* OVOM=1 (bit 28): use A2 field for operations override
-	 * A2V=1 (bit 27): A2 field (lo word) is valid
-	 * B0V=0: must be 0 when context_b=0, otherwise FMAN
-	 *   sends TX confirmation to FQ 0 which crashes.
-	 * A2 EBD=1 (bit 31 of lo): deallocate buffer after TX */
-	opts.fqd.context_a.hi = 0x18000000;
-	opts.fqd.context_a.lo = 0x80000000;
+	/* Match CDX accelerated forward-TX FQs for pool-backed frames.
+	 * Keep B0V=0 with context_b=0 so FMAN does not send TX confirmation
+	 * to FQ 0, but retain the full context override used by create_fwd_tx_fqs().
+	 */
+	opts.fqd.context_a.hi = 0x9a000000;
+	opts.fqd.context_a.lo = 0xC0000000;
 	opts.fqd.context_b = 0;
 	opts.we_mask = (QM_INITFQ_WE_DESTWQ | QM_INITFQ_WE_FQCTRL |
 			QM_INITFQ_WE_CONTEXTB | QM_INITFQ_WE_CONTEXTA);
@@ -1426,6 +1760,9 @@ static int ipsec_create_compat_tx_fq(struct dpa_ipsec_sainfo *ipsecsa_info,
 	ipsecsa_info->compat_tx_wq = wq;
 	cdx_create_type_fqid_info_in_procfs(fq, SA_DIR, ipsecsa_info->sa_proc_entry,
 			"compat_tx");
+	printk_ratelimited(KERN_INFO
+		"IPSEC_COMPAT_FQ: create fqid=0x%x channel=0x%x wq=%u sa=0x%x\n",
+		dpa_fq->fqid, channel, wq, sa_handle);
 	return 0;
 }
 
@@ -1460,13 +1797,158 @@ int cdx_ipsec_sa_set_compat_l2(void *handle, const uint8_t *hdr, uint8_t len,
 	return 0;
 }
 
+int cdx_ipsec_sa_set_compat_tx_dev(void *handle, struct net_device *dev)
+{
+	struct dpa_ipsec_sainfo *ipsecsa_info = (struct dpa_ipsec_sainfo *)handle;
+
+	if (!ipsecsa_info || !dev)
+		return -EINVAL;
+	ipsecsa_info->compat_tx_dev = dev;
+	return 0;
+}
+
 int cdx_ipsec_sa_set_compat_lan_dev(void *handle, struct net_device *dev)
 {
 	struct dpa_ipsec_sainfo *ipsecsa_info = (struct dpa_ipsec_sainfo *)handle;
 	if (!ipsecsa_info)
 		return -EINVAL;
 	ipsecsa_info->compat_lan_dev = dev;
+	ipsecsa_info->compat_tx_dev = dev;
 	return 0;
+}
+
+int cdx_ipsec_sa_set_compat_mtu(void *handle, uint16_t mtu)
+{
+	struct dpa_ipsec_sainfo *ipsecsa_info = (struct dpa_ipsec_sainfo *)handle;
+
+	if (!ipsecsa_info)
+		return -EINVAL;
+
+	ipsecsa_info->compat_mtu = mtu;
+	return 0;
+}
+
+static bool ipsec_compat_ipv6_tcp_offset(const uint8_t *pkt, uint32_t len,
+		unsigned int *thoff)
+{
+	uint8_t nexthdr;
+	unsigned int off;
+
+	if (len < sizeof(struct ipv6hdr))
+		return false;
+
+	nexthdr = ((const struct ipv6hdr *)pkt)->nexthdr;
+	off = sizeof(struct ipv6hdr);
+
+	for (;;) {
+		unsigned int hdrlen;
+
+		if (nexthdr == IPPROTO_TCP) {
+			*thoff = off;
+			return len >= off + sizeof(struct tcphdr);
+		}
+
+		switch (nexthdr) {
+		case NEXTHDR_HOP:
+		case NEXTHDR_ROUTING:
+		case NEXTHDR_DEST:
+			if (len < off + 2)
+				return false;
+			nexthdr = pkt[off];
+			hdrlen = (pkt[off + 1] + 1) * 8;
+			break;
+		default:
+			return false;
+		}
+
+		if (!hdrlen || len < off + hdrlen)
+			return false;
+		off += hdrlen;
+	}
+}
+
+static void ipsec_compat_mss_clamp(struct qm_fd *fd, uint16_t mtu)
+{
+	unsigned int tcp_hdrlen, thoff;
+	struct tcphdr *th;
+	uint8_t *pkt, *opt;
+	uint16_t newmss;
+	uint32_t len;
+	int i;
+
+	if (!mtu || !fd || fd->format != qm_fd_contig || !qm_fd_addr(fd))
+		return;
+
+	pkt = (uint8_t *)phys_to_virt((uint64_t)qm_fd_addr(fd)) + fd->offset;
+	len = fd->length20;
+	if (len < 1)
+		return;
+
+	switch (pkt[0] >> 4) {
+	case 4: {
+		struct iphdr *iph;
+
+		if (len < sizeof(struct iphdr))
+			return;
+		iph = (struct iphdr *)pkt;
+		thoff = iph->ihl * 4;
+		if (thoff < sizeof(struct iphdr) ||
+		    len < thoff + sizeof(struct tcphdr) ||
+		    iph->protocol != IPPROTO_TCP ||
+		    (ntohs(iph->frag_off) & (IP_MF | IP_OFFSET)))
+			return;
+		break;
+	}
+	case 6:
+		if (!ipsec_compat_ipv6_tcp_offset(pkt, len, &thoff))
+			return;
+		break;
+	default:
+		return;
+	}
+
+	th = (struct tcphdr *)(pkt + thoff);
+	if (!th->syn || th->rst)
+		return;
+
+	tcp_hdrlen = th->doff * 4;
+	if (tcp_hdrlen < sizeof(struct tcphdr) ||
+	    len < thoff + tcp_hdrlen ||
+	    mtu <= thoff + tcp_hdrlen)
+		return;
+
+	newmss = mtu - thoff - tcp_hdrlen;
+	opt = (uint8_t *)th;
+
+	for (i = sizeof(struct tcphdr); i < tcp_hdrlen;) {
+		unsigned int optlen;
+		uint16_t oldmss;
+
+		if (opt[i] == TCPOPT_EOL)
+			break;
+		if (opt[i] == TCPOPT_NOP) {
+			i++;
+			continue;
+		}
+		if (i + 1 >= tcp_hdrlen)
+			break;
+
+		optlen = opt[i + 1];
+		if (optlen < 2 || i + optlen > tcp_hdrlen)
+			break;
+
+		if (opt[i] == TCPOPT_MSS && optlen == TCPOLEN_MSS) {
+			oldmss = (opt[i + 2] << 8) | opt[i + 3];
+			if (oldmss <= newmss)
+				return;
+
+			opt[i + 2] = newmss >> 8;
+			opt[i + 3] = newmss & 0xff;
+			csum_replace2(&th->check, htons(oldmss), htons(newmss));
+			return;
+		}
+		i += optlen;
+	}
 }
 
 static void dpa_ipsec_ern_cb(struct qman_portal *qm, struct qman_fq *fq,
@@ -1505,7 +1987,230 @@ static void dpa_ipsec_ern_cb(struct qman_portal *qm, struct qman_fq *fq,
 	/* Release the buffer that was rejected by the enqueue.
 	 * Without this, ERN'd buffers leak from the source pool. */
 	if (qm_fd_addr(fd))
-		dpa_fd_release(NULL, fd);
+		ipsec_bp_release_fd((struct qm_fd *)fd,
+				&ipsec_bp_release_ern_cnt);
+}
+
+static int ipsec_compat_dma_sync_fd(const struct qm_fd *fd,
+		enum dma_data_direction dir, bool for_device)
+{
+	struct dpa_bp *bp;
+
+	if (!fd || fd->format != qm_fd_contig || !qm_fd_addr(fd))
+		return -EINVAL;
+
+	bp = dpa_bpid2pool(fd->bpid);
+	if (!bp || !bp->dev || !bp->size)
+		return -ENODEV;
+
+	if (for_device)
+		dma_sync_single_for_device(bp->dev, qm_fd_addr(fd), bp->size, dir);
+	else
+		dma_sync_single_for_cpu(bp->dev, qm_fd_addr(fd), bp->size, dir);
+
+	return 0;
+}
+
+static void ipsec_compat_dma_sync_sg_for_cpu(const struct qm_sg_entry *sg)
+{
+	struct dpa_bp *bp;
+
+	if (!sg || !qm_sg_addr(sg))
+		return;
+
+	bp = dpa_bpid2pool(qm_sg_entry_get_bpid(sg));
+	if (!bp || !bp->dev || !bp->size)
+		return;
+
+	dma_sync_single_for_cpu(bp->dev, qm_sg_addr(sg), bp->size,
+			DMA_BIDIRECTIONAL);
+}
+
+static void ipsec_compat_dma_sync_buf_for_cpu(struct dpa_bp *bp, dma_addr_t addr)
+{
+	if (!bp || !bp->dev || !bp->size || !addr)
+		return;
+
+	dma_sync_single_for_cpu(bp->dev, addr, bp->size, DMA_BIDIRECTIONAL);
+}
+
+static void ipsec_release_sg_payload_fd(const struct qm_sg_entry *sg)
+{
+	struct qm_fd fd;
+
+	if (!sg || !qm_sg_addr(sg) || qm_sg_entry_get_ext(sg))
+		return;
+	if (qm_sg_entry_get_bpid(sg) == 0xff)
+		return;
+
+	memset(&fd, 0, sizeof(fd));
+	qm_fd_addr_set64(&fd, qm_sg_addr(sg));
+	fd.format = qm_fd_contig;
+	fd.length20 = qm_sg_entry_get_len(sg);
+	fd.offset = qm_sg_entry_get_offset(sg);
+	fd.bpid = qm_sg_entry_get_bpid(sg);
+
+	ipsec_bp_release_fd(&fd, &ipsec_bp_release_sg_payload_cnt);
+}
+
+static int ipsec_copy_sg_list_to_contig_fd(const struct qm_sg_entry *sgt,
+		struct qm_fd *compat_fd, bool release_payload)
+{
+	struct bm_buffer bmb;
+	struct dpa_bp *bp;
+	uint8_t *dst_base;
+	uint32_t payload_len = 0;
+	uint32_t dst_off;
+	uint16_t new_off = 64;
+	int i;
+	bool final = false;
+
+	if (!sgt || !compat_fd)
+		return -EINVAL;
+
+	for (i = 0; i < IPSEC_COMPAT_MAX_SG_ENTRIES; i++) {
+		const struct qm_sg_entry *sg = &sgt[i];
+
+		if (qm_sg_entry_get_ext(sg))
+			return -EOPNOTSUPP;
+
+		if (qm_sg_addr(sg) && qm_sg_entry_get_len(sg))
+			payload_len += qm_sg_entry_get_len(sg);
+
+		if (qm_sg_entry_get_final(sg)) {
+			final = true;
+			break;
+		}
+	}
+
+	if (!final || !payload_len)
+		return -EINVAL;
+
+	bp = ipsecinfo.ipsec_bp;
+	if (!bp || !bp->pool || !bp->size)
+		return -ENODEV;
+	if ((uint32_t)new_off + payload_len > bp->size)
+		return -ENOSPC;
+
+	if (bman_acquire(bp->pool, &bmb, 1, 0) != 1) {
+		ipsec_bp_note_alloc(IPSEC_BP_SGLIST, -ENOBUFS);
+		ipsec_log_bp_snapshot("sglist-enobufs");
+		return -ENOBUFS;
+	}
+	ipsec_bp_note_alloc(IPSEC_BP_SGLIST, 0);
+
+	dst_base = (uint8_t *)phys_to_virt((uint64_t)bmb.addr);
+	if (!dst_base) {
+		while (bman_release(bp->pool, &bmb, 1, 0))
+			cpu_relax();
+		return -EFAULT;
+	}
+
+	ipsec_compat_dma_sync_buf_for_cpu(bp, bmb.addr);
+
+	dst_off = new_off;
+	for (i = 0; i < IPSEC_COMPAT_MAX_SG_ENTRIES; i++) {
+		const struct qm_sg_entry *sg = &sgt[i];
+		uint8_t *src_base;
+		uint32_t len;
+
+		len = qm_sg_entry_get_len(sg);
+		if (qm_sg_addr(sg) && len) {
+			ipsec_compat_dma_sync_sg_for_cpu(sg);
+			src_base = (uint8_t *)phys_to_virt((uint64_t)qm_sg_addr(sg));
+			if (!src_base) {
+				while (bman_release(bp->pool, &bmb, 1, 0))
+					cpu_relax();
+				return -EFAULT;
+			}
+			memcpy(dst_base + dst_off,
+			       src_base + qm_sg_entry_get_offset(sg), len);
+			dst_off += len;
+		}
+
+		if (qm_sg_entry_get_final(sg))
+			break;
+	}
+
+	memset(compat_fd, 0, sizeof(*compat_fd));
+	qm_fd_addr_set64(compat_fd, bmb.addr);
+	compat_fd->format = qm_fd_contig;
+	compat_fd->bpid = bp->bpid;
+	compat_fd->offset = new_off;
+	compat_fd->length20 = payload_len;
+
+	if (release_payload) {
+		for (i = 0; i < IPSEC_COMPAT_MAX_SG_ENTRIES; i++) {
+			const struct qm_sg_entry *sg = &sgt[i];
+
+			if (qm_sg_addr(sg) && qm_sg_entry_get_len(sg))
+				ipsec_release_sg_payload_fd(sg);
+
+			if (qm_sg_entry_get_final(sg))
+				break;
+		}
+	}
+
+	return 0;
+}
+
+static int ipsec_copy_sg_payload_to_contig_fd(const struct qm_sg_entry *sg,
+		struct qm_fd *compat_fd, bool release_payload)
+{
+	struct bm_buffer bmb;
+	struct dpa_bp *bp;
+	uint8_t *src_base;
+	uint8_t *dst_base;
+	uint16_t new_off = 64;
+	uint32_t payload_len;
+	uint16_t payload_off;
+
+	if (!sg || !compat_fd)
+		return -EINVAL;
+	if (qm_sg_entry_get_ext(sg) || !qm_sg_addr(sg) ||
+	    !qm_sg_entry_get_len(sg))
+		return -EINVAL;
+
+	bp = ipsecinfo.ipsec_bp;
+	if (!bp || !bp->pool || !bp->size)
+		return -ENODEV;
+
+	payload_len = qm_sg_entry_get_len(sg);
+	payload_off = qm_sg_entry_get_offset(sg);
+	if ((uint32_t)new_off + payload_len > bp->size)
+		return -ENOSPC;
+
+	if (bman_acquire(bp->pool, &bmb, 1, 0) != 1) {
+		ipsec_bp_note_alloc(IPSEC_BP_PAYLOAD, -ENOBUFS);
+		ipsec_log_bp_snapshot("payload-enobufs");
+		return -ENOBUFS;
+	}
+	ipsec_bp_note_alloc(IPSEC_BP_PAYLOAD, 0);
+
+	src_base = (uint8_t *)phys_to_virt((uint64_t)qm_sg_addr(sg));
+	dst_base = (uint8_t *)phys_to_virt((uint64_t)bmb.addr);
+	if (!src_base || !dst_base) {
+		while (bman_release(bp->pool, &bmb, 1, 0))
+			cpu_relax();
+		return -EFAULT;
+	}
+
+	ipsec_compat_dma_sync_sg_for_cpu(sg);
+	ipsec_compat_dma_sync_buf_for_cpu(bp, bmb.addr);
+
+	memcpy(dst_base + new_off, src_base + payload_off, payload_len);
+
+	memset(compat_fd, 0, sizeof(*compat_fd));
+	qm_fd_addr_set64(compat_fd, bmb.addr);
+	compat_fd->format = qm_fd_contig;
+	compat_fd->bpid = bp->bpid;
+	compat_fd->offset = new_off;
+	compat_fd->length20 = payload_len;
+
+	if (release_payload)
+		ipsec_release_sg_payload_fd(sg);
+
+	return 0;
 }
 
 static int ipsec_build_compat_fd(const struct qm_fd *fd,
@@ -1530,31 +2235,15 @@ static int ipsec_build_compat_fd(const struct qm_fd *fd,
 	/* SG returns need normalization because LAN compat delivery depends on
 	 * direct frame access for neighbor lookup and L2 prepend. */
 	if (fd->format == qm_fd_sg) {
+		int err;
+
 		sgt = (struct qm_sg_entry *)phys_to_virt((uint64_t)qm_fd_addr(fd));
 		if (!sgt)
 			return -EINVAL;
-
-		sg = &sgt[0];
-		if (!qm_sg_addr(sg) || !qm_sg_entry_get_len(sg)) {
-			sg = &sgt[1];
-			if (!qm_sg_addr(sg) || !qm_sg_entry_get_len(sg))
-				return -EINVAL;
-		}
-
-		if (qm_sg_entry_get_ext(sg))
-			return -EINVAL;
-
-		memset(compat_fd, 0, sizeof(*compat_fd));
-		qm_fd_addr_set64(compat_fd, qm_sg_addr(sg));
-		compat_fd->format = qm_fd_contig;
-		compat_fd->length20 = qm_sg_entry_get_len(sg);
-		compat_fd->offset = qm_sg_entry_get_offset(sg);
-		compat_fd->bpid = qm_sg_entry_get_bpid(sg);
-		if (!qm_fd_addr(compat_fd) || !compat_fd->length20)
-			return -EINVAL;
-		compat_fd->status = 0;
-		compat_fd->cmd = 0;
-		return 0;
+		err = ipsec_copy_sg_list_to_contig_fd(sgt, compat_fd, false);
+		if (!err)
+			dpa_fd_release(NULL, fd);
+		return err;
 	}
 
 	if (fd->format != qm_fd_compound || !qm_fd_addr(fd))
@@ -1573,18 +2262,27 @@ static int ipsec_build_compat_fd(const struct qm_fd *fd,
 			return -EINVAL;
 	}
 
-	memset(compat_fd, 0, sizeof(*compat_fd));
-	qm_fd_addr_set64(compat_fd, qm_sg_addr(sg));
-	compat_fd->format = qm_sg_entry_get_ext(sg) ? qm_fd_sg : qm_fd_contig;
-	compat_fd->length20 = qm_sg_entry_get_len(sg);
-	compat_fd->offset = qm_sg_entry_get_offset(sg);
-	compat_fd->bpid = qm_sg_entry_get_bpid(sg);
-	if (!qm_fd_addr(compat_fd) || !compat_fd->length20)
-		return -EINVAL;
-	compat_fd->status = 0;
-	compat_fd->cmd = 0;
+	if (qm_sg_entry_get_ext(sg)) {
+		struct qm_sg_entry *ext_sgt;
+		int err;
 
-	return 0;
+		ext_sgt = (struct qm_sg_entry *)phys_to_virt(
+				(uint64_t)qm_sg_addr(sg));
+		if (!ext_sgt)
+			return -EINVAL;
+
+		err = ipsec_copy_sg_list_to_contig_fd(ext_sgt, compat_fd, true);
+		if (err) {
+			printk_ratelimited(KERN_INFO
+				"IPSEC_COMPAT: compound-ext-copy-failed st=0x%08x err=%d\n",
+				fd->status, err);
+			ipsec_log_bp_snapshot("compound-ext-copy-failed");
+			return err;
+		}
+		return 0;
+	}
+
+	return ipsec_copy_sg_payload_to_contig_fd(sg, compat_fd, true);
 }
 
 /* Return inner ETH(+VLAN) header length if payload starts with L2 then IP. */
@@ -1646,8 +2344,12 @@ static int ipsec_compat_rebuild_with_headroom(struct qm_fd *compat_fd,
 	if ((uint32_t)new_off + compat_fd->length20 > bp->size)
 		return -ENOSPC;
 
-	if (bman_acquire(bp->pool, &bmb, 1, 0) != 1)
+	if (bman_acquire(bp->pool, &bmb, 1, 0) != 1) {
+		ipsec_bp_note_alloc(IPSEC_BP_REBUILD, -ENOBUFS);
+		ipsec_log_bp_snapshot("rebuild-enobufs");
 		return -ENOBUFS;
+	}
+	ipsec_bp_note_alloc(IPSEC_BP_REBUILD, 0);
 
 	src_base = (uint8_t *)phys_to_virt((uint64_t)qm_fd_addr(compat_fd));
 	dst_base = (uint8_t *)phys_to_virt((uint64_t)bmb.addr);
@@ -1664,7 +2366,7 @@ static int ipsec_compat_rebuild_with_headroom(struct qm_fd *compat_fd,
 		payload_len);
 
 	/* Drop the old frame backing this compat FD and switch to rebuilt one. */
-	dpa_fd_release(NULL, compat_fd);
+	ipsec_bp_release_fd(compat_fd, &ipsec_bp_release_rebuild_old_cnt);
 
 	memset(compat_fd, 0, sizeof(*compat_fd));
 	qm_fd_addr_set64(compat_fd, bmb.addr);
@@ -1690,6 +2392,8 @@ static enum qman_cb_dqrr_result ipsec_from_sec_compat_handler(
 	uint16_t sa_hint = 0;
 	uint16_t peer_sa_hint = 0;
 	uint8_t remap_reason = IPSEC_NOFQ_REMAP_OK;
+	struct net_device *runtime_tx_dev = NULL;
+	bool runtime_tx_dev_is_preferred = false;
 	int err;
 
 	ipsecsa_info = container_of((struct dpa_fq *)fq,
@@ -1709,6 +2413,7 @@ static enum qman_cb_dqrr_result ipsec_from_sec_compat_handler(
 		printk_ratelimited(KERN_ERR
 			"IPSEC_COMPAT: unwrap-failed fqid=0x%x fmt=%u st=0x%08x err=%d\n",
 			fq->fqid, dq->fd.format, dq->fd.status, err);
+		ipsec_log_bp_snapshot("unwrap-failed");
 		/* Keep traffic moving for known SEC return-shape failures. */
 		if (dq->fd.status == 0x50000008) {
 			static atomic64_t ipsec_bpderr_drop_cnt = ATOMIC64_INIT(0);
@@ -1727,7 +2432,18 @@ static enum qman_cb_dqrr_result ipsec_from_sec_compat_handler(
 			fq->fqid, compat_fd.format, compat_fd.length20,
 			compat_fd.offset, compat_fd.bpid,
 			(unsigned long long)qm_fd_addr(&compat_fd));
-		dpa_fd_release(NULL, &compat_fd);
+		ipsec_bp_release_fd(&compat_fd, &ipsec_bp_release_compat_cnt);
+		goto release_reclaim;
+	}
+
+	err = ipsec_compat_dma_sync_fd(&compat_fd, DMA_BIDIRECTIONAL,
+			false);
+	if (err) {
+		printk_ratelimited(KERN_ERR
+			"IPSEC_COMPAT: dma-sync-cpu-failed from_sec=0x%x fmt=%u len=%u off=%u bpid=%u err=%d\n",
+			fq->fqid, compat_fd.format, compat_fd.length20,
+			compat_fd.offset, compat_fd.bpid, err);
+		ipsec_bp_release_fd(&compat_fd, &ipsec_bp_release_compat_cnt);
 		goto release_reclaim;
 	}
 	if (compat_fd.format == qm_fd_contig && qm_fd_addr(&compat_fd)) {
@@ -1832,7 +2548,7 @@ static enum qman_cb_dqrr_result ipsec_from_sec_compat_handler(
 		atomic64_inc(&ipsec_reinject_fallback_drop_cnt);
 		ipsec_log_reinject_snapshot(fq, &compat_fd, sa_hint,
 				"fallback-drop-compound", 0);
-		dpa_fd_release(NULL, &compat_fd);
+		ipsec_bp_release_fd(&compat_fd, &ipsec_bp_release_compat_cnt);
 		goto release_reclaim;
 	}
 
@@ -1846,6 +2562,21 @@ static enum qman_cb_dqrr_result ipsec_from_sec_compat_handler(
 		compat_fd.length20 -= inner_l2_len;
 	}
 
+	if (tx_ipsecsa_info->compat_lan_dev &&
+	    compat_fd.format == qm_fd_contig && qm_fd_addr(&compat_fd)) {
+		buf = (uint8_t *)phys_to_virt(
+				(uint64_t)qm_fd_addr(&compat_fd));
+		if (buf && ipsec_compat_should_learning_punt(
+		    buf + compat_fd.offset, compat_fd.length20)) {
+			err = ipsec_compat_punt_inner_to_stack(ipsecsa_info,
+					&compat_fd);
+			if (!err)
+				goto release_reclaim;
+
+			atomic64_inc(&ipsec_learning_skip_cnt);
+		}
+	}
+
 	/* For inbound LAN delivery: resolve destination MAC via ARP cache.
 	 * The L2 template has src=LAN-MAC but dst=zeros from SA creation.
 	 * Patch dst MAC from the neighbour table before prepend. */
@@ -1856,7 +2587,12 @@ static enum qman_cb_dqrr_result ipsec_from_sec_compat_handler(
 		__be32 inner_dst;
 		struct neighbour *neigh;
 		struct net_device *ndev;
+		uint8_t resolved_ha[ETH_ALEN];
+		bool have_resolved_ha = false;
 		struct net_device *resolved_dev = NULL;
+
+		ipsec_compat_mss_clamp(&compat_fd,
+				tx_ipsecsa_info->compat_mtu);
 
 		buf = (uint8_t *)phys_to_virt(
 				(uint64_t)qm_fd_addr(&compat_fd));
@@ -1868,6 +2604,8 @@ static enum qman_cb_dqrr_result ipsec_from_sec_compat_handler(
 			neigh = neigh_lookup(&arp_tbl, &inner_dst,
 					tx_ipsecsa_info->compat_lan_dev);
 			if (neigh && (neigh->nud_state & NUD_VALID)) {
+				memcpy(resolved_ha, neigh->ha, ETH_ALEN);
+				have_resolved_ha = true;
 				memcpy(tx_ipsecsa_info->compat_l2_hdr,
 					neigh->ha, ETH_ALEN);
 				resolved_dev = tx_ipsecsa_info->compat_lan_dev;
@@ -1895,6 +2633,8 @@ static enum qman_cb_dqrr_result ipsec_from_sec_compat_handler(
 						continue;
 					}
 
+					memcpy(resolved_ha, neigh->ha, ETH_ALEN);
+					have_resolved_ha = true;
 					memcpy(tx_ipsecsa_info->compat_l2_hdr,
 						neigh->ha, ETH_ALEN);
 					resolved_dev = ndev;
@@ -1904,14 +2644,78 @@ static enum qman_cb_dqrr_result ipsec_from_sec_compat_handler(
 			}
 			rcu_read_unlock();
 
-				if (resolved_dev) {
+				if (resolved_dev && have_resolved_ha) {
+					struct net_device *wire_dev = resolved_dev;
+					struct net_device *tx_dev = resolved_dev;
+					struct net_device *src_dev = resolved_dev;
+					uint16_t vlan_id = 0;
+					bool has_vlan = false;
+					uint8_t l2_len;
+
+					if (netif_is_bridge_master(resolved_dev)) {
+						if (!rtnl_trylock()) {
+							if (ipsec_lan_neigh_diag_enable)
+								printk_ratelimited(KERN_INFO
+									"IPSEC_COMPAT: lan-fdb-skip dst=%pI4 bridge=%s reason=rtnl-busy\n",
+									&inner_dst, resolved_dev->name);
+							return ipsec_exception_pkt_handler(qm, fq, dq);
+						}
+						wire_dev = br_fdb_find_port(resolved_dev,
+								resolved_ha, 0);
+						rtnl_unlock();
+						if (!wire_dev) {
+							if (ipsec_lan_neigh_diag_enable)
+								printk_ratelimited(KERN_INFO
+									"IPSEC_COMPAT: lan-fdb-miss dst=%pI4 bridge=%s\n",
+									&inner_dst, resolved_dev->name);
+							return ipsec_exception_pkt_handler(qm, fq, dq);
+						}
+						src_dev = resolved_dev;
+					}
+
+					if (is_vlan_dev(wire_dev)) {
+						vlan_id = vlan_dev_vlan_id(wire_dev);
+						tx_dev = vlan_dev_real_dev(wire_dev);
+						has_vlan = true;
+					} else {
+						tx_dev = wire_dev;
+					}
+
+					if (!tx_dev || tx_dev->type != ARPHRD_ETHER) {
+						if (ipsec_lan_neigh_diag_enable)
+							printk_ratelimited(KERN_INFO
+								"IPSEC_COMPAT: lan-txdev-invalid dst=%pI4 resolved=%s wire=%s tx=%s\n",
+								&inner_dst, resolved_dev->name,
+								wire_dev ? wire_dev->name : "-",
+								tx_dev ? tx_dev->name : "-");
+						return ipsec_exception_pkt_handler(qm, fq, dq);
+					}
+
+					memcpy(tx_ipsecsa_info->compat_l2_hdr,
+						resolved_ha, ETH_ALEN);
+					memcpy(tx_ipsecsa_info->compat_l2_hdr + ETH_ALEN,
+						src_dev->dev_addr, ETH_ALEN);
+					l2_len = 12;
+					if (has_vlan) {
+						tx_ipsecsa_info->compat_l2_hdr[l2_len++] = 0x81;
+						tx_ipsecsa_info->compat_l2_hdr[l2_len++] = 0x00;
+						tx_ipsecsa_info->compat_l2_hdr[l2_len++] = (vlan_id >> 8) & 0xff;
+						tx_ipsecsa_info->compat_l2_hdr[l2_len++] = vlan_id & 0xff;
+					}
+					tx_ipsecsa_info->compat_l2_hdr[l2_len++] = 0x08;
+					tx_ipsecsa_info->compat_l2_hdr[l2_len++] = 0x00;
+					tx_ipsecsa_info->compat_l2_len = l2_len;
+					tx_ipsecsa_info->compat_l2_pppoe_off = 0;
+					runtime_tx_dev = tx_dev;
+
 					if (ipsec_lan_neigh_diag_enable &&
 					    resolved_dev != tx_ipsecsa_info->compat_lan_dev) {
 						printk_ratelimited(KERN_INFO
-							"IPSEC_COMPAT: lan-neigh-fallback dst=%pI4 bound=%s resolved=%s\n",
+							"IPSEC_COMPAT: lan-neigh-fallback dst=%pI4 bound=%s resolved=%s tx=%s\n",
 							&inner_dst,
 							tx_ipsecsa_info->compat_lan_dev->name,
-							resolved_dev->name);
+							resolved_dev->name,
+							runtime_tx_dev->name);
 					}
 				} else {
 					if (ipsec_lan_neigh_diag_enable)
@@ -1943,6 +2747,7 @@ static enum qman_cb_dqrr_result ipsec_from_sec_compat_handler(
 				"IPSEC_COMPAT: headroom-rebuild-failed from_sec=0x%x len=%u off=%u need=%u err=%d\n",
 				fq->fqid, compat_fd.length20, compat_fd.offset,
 				tx_ipsecsa_info->compat_l2_len, err);
+			ipsec_log_bp_snapshot("headroom-rebuild-failed");
 			goto release_reclaim;
 		}
 	}
@@ -1984,22 +2789,75 @@ static enum qman_cb_dqrr_result ipsec_from_sec_compat_handler(
 		*(struct sk_buff **)phys_to_virt(
 				(uint64_t)qm_fd_addr(&compat_fd)) = NULL;
 
-	/* Mark compat egress FDs so dpaa_eth post-TX hooks can track
-	 * tx-conf/errq/ERN fate for noFQ-remapped return traffic. */
+	/* Do not tag compat TX in fd->status/cmd.  For TX frames this word is
+	 * the FMAN command field; bit 31 is FM_FD_CMD_FCO, not free debug
+	 * state.  Setting it here overrides FQ context on the final egress
+	 * handoff and can prevent the encrypted frame from reaching the wire.
+	 */
 	{
 		u64 tag_cnt;
 
-		compat_fd.status |= IPSEC_DBG_DPOVRD_MASK;
 		tag_cnt = atomic64_inc_return(&ipsec_compat_posttx_tag_cnt);
 		if (ipsec_compat_diag_enable &&
 		    ipsec_compat_diag_should_log(tag_cnt))
 			printk_ratelimited(KERN_INFO
-				"IPSEC_COMPAT_DIAG: stage=posttx-tag from_sec=0x%x compat_tx=0x%x ch=0x%x wq=%u seq=%llu st=0x%08x len=%u off=%u fmt=%u\n",
+				"IPSEC_COMPAT_DIAG: stage=posttx-ready from_sec=0x%x compat_tx=0x%x ch=0x%x wq=%u seq=%llu st=0x%08x len=%u off=%u fmt=%u\n",
 				fq->fqid, tx_ipsecsa_info->compat_tx_fq.fqid,
 				tx_ipsecsa_info->compat_tx_channel,
 				tx_ipsecsa_info->compat_tx_wq,
 				(unsigned long long)tag_cnt, compat_fd.status,
 				compat_fd.length20, compat_fd.offset, compat_fd.format);
+	}
+
+	err = ipsec_compat_dma_sync_fd(&compat_fd, DMA_BIDIRECTIONAL, true);
+	if (err) {
+		printk_ratelimited(KERN_ERR
+			"IPSEC_COMPAT: dma-sync-device-failed from_sec=0x%x compat_tx=0x%x len=%u off=%u fmt=%u bpid=%u err=%d\n",
+			fq->fqid, tx_ipsecsa_info->compat_tx_fq.fqid,
+			compat_fd.length20, compat_fd.offset, compat_fd.format,
+			compat_fd.bpid, err);
+		ipsec_bp_release_fd(&compat_fd, &ipsec_bp_release_compat_cnt);
+		goto release_reclaim;
+	}
+
+	if (!runtime_tx_dev && ipsec_compat_txdev_prefer &&
+	    tx_ipsecsa_info->compat_tx_dev) {
+		runtime_tx_dev = tx_ipsecsa_info->compat_tx_dev;
+		runtime_tx_dev_is_preferred = true;
+	}
+
+	if (runtime_tx_dev) {
+		struct net_device *tx_dev = runtime_tx_dev;
+
+		/* Runtime LAN resolution may select a bridge/VLAN backing device that
+		 * was not known when CMM programmed the SA.  For WAN, prefer the
+		 * SA's physical egress netdev when available so post-SEC frames use
+		 * the same DPAA egress queueing path as normal TX. */
+		err = dpaa_ipsec_xmit_compat_fd(tx_dev,
+				&compat_fd);
+		if (!err) {
+			if (ipsec_fd_from_ipsec_bp(&compat_fd))
+				atomic64_inc(&ipsec_bp_txdev_enqueue_ok_cnt);
+			if (ipsec_compat_diag_enable &&
+			    ipsec_compat_diag_should_log(
+				    atomic64_read(&ipsec_compat_posttx_tag_cnt)))
+				printk_ratelimited(KERN_INFO
+					"IPSEC_COMPAT_DIAG: stage=txdev-enqueue-ok from_sec=0x%x dev=%s len=%u off=%u fmt=%u st=0x%08x\n",
+					fq->fqid,
+					tx_dev->name,
+					compat_fd.length20, compat_fd.offset,
+					compat_fd.format, compat_fd.status);
+			goto release_reclaim;
+		}
+		printk_ratelimited(KERN_ERR
+			"IPSEC_COMPAT: txdev-enqueue-failed from_sec=0x%x dev=%s err=%d fallback_compat_tx=0x%x len=%u off=%u fmt=%u st=0x%08x\n",
+			fq->fqid, tx_dev->name, err, tx_ipsecsa_info->compat_tx_fq.fqid,
+			compat_fd.length20, compat_fd.offset,
+			compat_fd.format, compat_fd.status);
+		if (!runtime_tx_dev_is_preferred) {
+			ipsec_bp_release_fd(&compat_fd, &ipsec_bp_release_compat_cnt);
+			goto release_reclaim;
+		}
 	}
 
 	err = qman_enqueue(&tx_ipsecsa_info->compat_tx_fq.fq_base, &compat_fd, 0);
@@ -2009,8 +2867,13 @@ static enum qman_cb_dqrr_result ipsec_from_sec_compat_handler(
 			fq->fqid, tx_ipsecsa_info->compat_tx_fq.fqid, err,
 			compat_fd.length20, compat_fd.bpid, compat_fd.offset,
 			compat_fd.format, compat_fd.status);
-		dpa_fd_release(NULL, &compat_fd);
+		if (ipsec_fd_from_ipsec_bp(&compat_fd))
+			atomic64_inc(&ipsec_bp_enqueue_fail_cnt);
+		ipsec_log_bp_snapshot("compat-enqueue-failed");
+		ipsec_bp_release_fd(&compat_fd, &ipsec_bp_release_compat_cnt);
 		} else {
+			if (ipsec_fd_from_ipsec_bp(&compat_fd))
+				atomic64_inc(&ipsec_bp_compat_enqueue_ok_cnt);
 			if (ipsec_compat_diag_enable && ipsec_compat_diag_should_log(
 					atomic64_read(&ipsec_compat_posttx_tag_cnt)))
 				printk_ratelimited(KERN_INFO
@@ -2041,6 +2904,12 @@ static uint32_t ipsec_exception_pkt_cnt;
 void print_ipsec_exception_pkt_cnt(void)
 {
 	printk(KERN_INFO "ipsec_exception_pkt_cnt=%u\n", ipsec_exception_pkt_cnt);
+	printk(KERN_INFO
+		"ipsec_learning_punt=%llu seen=%llu skip=%llu enabled=%u\n",
+		(unsigned long long)atomic64_read(&ipsec_learning_punt_cnt),
+		(unsigned long long)atomic64_read(&ipsec_learning_seen_cnt),
+		(unsigned long long)atomic64_read(&ipsec_learning_skip_cnt),
+		ipsec_compat_learning_punt ? 1 : 0);
 }
 
 
@@ -3400,6 +4269,18 @@ int cdx_dpa_ipsec_init(void)
 	}
 	for (i = 0; i < 4; i++)
 		atomic64_set(&ipsec_from_sec_format_cnt[i], 0);
+	for (i = 0; i < IPSEC_BP_SITE_MAX; i++) {
+		atomic64_set(&ipsec_bp_alloc_ok_cnt[i], 0);
+		atomic64_set(&ipsec_bp_alloc_enobufs_cnt[i], 0);
+		atomic64_set(&ipsec_bp_alloc_fail_cnt[i], 0);
+	}
+	atomic64_set(&ipsec_bp_release_sg_payload_cnt, 0);
+	atomic64_set(&ipsec_bp_release_rebuild_old_cnt, 0);
+	atomic64_set(&ipsec_bp_release_compat_cnt, 0);
+	atomic64_set(&ipsec_bp_release_ern_cnt, 0);
+	atomic64_set(&ipsec_bp_txdev_enqueue_ok_cnt, 0);
+	atomic64_set(&ipsec_bp_compat_enqueue_ok_cnt, 0);
+	atomic64_set(&ipsec_bp_enqueue_fail_cnt, 0);
 	for (i = 0; i < IPSEC_NOFQ_REMAP_MAX; i++)
 		atomic64_set(&ipsec_nofq_remap_reason_cnt[i], 0);
 #ifdef CS_TAIL_DROP
@@ -3486,6 +4367,7 @@ void cdx_dpa_ipsec_exit(void)
 		(unsigned long long)atomic64_read(&ipsec_from_sec_format_cnt[1]),
 		(unsigned long long)atomic64_read(&ipsec_from_sec_format_cnt[2]),
 		(unsigned long long)atomic64_read(&ipsec_from_sec_format_cnt[3]));
+	ipsec_log_bp_snapshot("exit");
 	ipsec_destroy_ofport_reinject_fq(&ipsecinfo);
 #ifdef CS_TAIL_DROP
 	printk_ratelimited(KERN_INFO

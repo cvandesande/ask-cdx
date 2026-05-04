@@ -721,14 +721,15 @@ static int IPsec_handle_SA_SET_NATT(U16 *p, U16 Length)
 
 static int ipsec_push_sa_to_fast_path(PSAEntry sa)
 {
+	int rc;
+
 	if (IS_NATT_SA(sa))
-	{
-		cdx_ipsec_process_udp_classification_table_entry(sa);
-	}
-	else {
-		if (cdx_ipsec_add_classification_table_entry(sa))
-			return ERR_CREATION_FAILED;
-	}
+		rc = cdx_ipsec_process_udp_classification_table_entry(sa);
+	else
+		rc = cdx_ipsec_add_classification_table_entry(sa);
+
+	if (rc)
+		return ERR_CREATION_FAILED;
 
 	if (!(sa->xfrm_state = cdx_get_xfrm_state_of_sa(sa->netdev, sa->handle)))
 	{

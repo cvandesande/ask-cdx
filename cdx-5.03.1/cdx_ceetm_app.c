@@ -82,6 +82,15 @@ struct qman_fq *cdx_get_txfq(struct eth_iface_info *eth_info, void *info)
 	struct tQM_context_ctl *qm_ctx;
 	struct qman_fq *egress_fq;
 
+	if (!eth_info || !qosmark)
+		return NULL;
+
+	if (eth_info->portid >= MAX_PHY_PORTS) {
+		ceetm_err("%s::invalid portid %u\n",
+			__FUNCTION__, eth_info->portid);
+		return NULL;
+	}
+
 	qm_ctx = QM_GET_CONTEXT(eth_info->portid);
 	if (qm_ctx->qos_enabled) {
 		egress_fq = ceetm_get_egressfq(qm_ctx, qosmark->chnl_id, qosmark->queue, ff);
@@ -109,6 +118,14 @@ int cdx_get_tx_dscp_fq_map(struct eth_iface_info *eth_info, uint8_t *is_dscp_fq_
 	{
 		if(info)
 			qosmark = info;
+
+		*is_dscp_fq_map = 0;
+		if (!eth_info || eth_info->portid >= MAX_PHY_PORTS) {
+			if (eth_info)
+				ceetm_err("%s::invalid portid %u\n",
+					__FUNCTION__, eth_info->portid);
+			return 0;
+		}
 
 		qm_ctx = QM_GET_CONTEXT(eth_info->portid);
 		if (qm_ctx->qos_enabled) {

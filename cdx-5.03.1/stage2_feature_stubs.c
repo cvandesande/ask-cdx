@@ -20,6 +20,7 @@ struct dpa_bp;
 int dpaa_get_vap_fwd_fq(uint16_t vap_id, uint32_t *fqid, uint32_t hash);
 int dpaa_get_wifi_dev(uint16_t vap_id, void **netdev);
 int dpaa_get_wifi_ohport_handle(uint32_t *oh_handle);
+int vwd_is_no_l2_itf_device(struct net_device *dev);
 void drain_tx_bp_pool(struct dpa_bp *bp);
 void *M_ipsec_sa_cache_lookup_by_h(U16 handle);
 
@@ -92,6 +93,12 @@ int dpaa_get_wifi_ohport_handle(uint32_t *oh_handle)
 	if (oh_handle)
 		*oh_handle = 0;
 	return FAILURE;
+}
+
+int vwd_is_no_l2_itf_device(struct net_device *dev)
+{
+	(void)dev;
+	return 0;
 }
 
 void drain_tx_bp_pool(struct dpa_bp *bp)
