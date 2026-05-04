@@ -86,7 +86,7 @@ Structure and Macro definitions
 #define CEETM_TOKEN_WHOLE_MAXVAL        0x7ff
 #define CEETM_TOKEN_FRAC_MAXVAL         0x1fff
 /* default TD value */
-#define DEFAULT_CQ_DEPTH        8
+#define DEFAULT_CQ_DEPTH        64
 
 /* shaper types */
 #define CHANNEL_SHAPER_TYPE	0		
