@@ -10,9 +10,14 @@ it through the standard package workflow.
 `openwrt/package/kernel/ask-cdx/` remains responsible for:
 - package metadata and dependency declarations
 - OpenWrt init/service integration under `files/`
-- any future OpenWrt-local patch queue, if one is added intentionally
+- exceptional OpenWrt-local integration patches only when a change truly cannot
+  live in this source repo
 
 For reproducible packaging, OpenWrt should always pin an exact commit or tag
 from this repository through `PKG_SOURCE_VERSION` and verify the archive with
 `PKG_MIRROR_HASH`. Tags should mark packaging-relevant source states; commits
 must stay immutable once referenced by a released OpenWrt package.
+
+Durable CDX behavior changes should be made directly in `cdx-5.03.1/`, then
+packaged by updating the OpenWrt pin and mirror hash. Avoid carrying normal CDX
+source fixes as OpenWrt package patches.
