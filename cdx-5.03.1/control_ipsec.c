@@ -519,25 +519,44 @@ static int IPsec_handle_DELETE_SA(U16 *p, U16 Length)
 int cdx_ipsec_handle_get_inbound_sagd(U32 spi, U16 * sagd )
 {
 	PSAEntry pEntry;
+	PSAEntry match = NULL;
+	U32 be_spi = htonl(spi);
+	int matches = 0;
 	int i;
 
 #ifdef CONTROL_IPSEC_DEBUG
 	printk(KERN_INFO "%s::\n", __func__);
 #endif
-	// scan sa_cache and retrun matching handle
+	if (!sagd)
+		return ERR_CT_ENTRY_INVALID_SA;
+
+	*sagd = 0;
+
+	// scan sa_cache and return matching handle
 	for(i = 0; i < NUM_SA_ENTRIES; i++)
 	{
 		struct slist_entry *entry;
 		slist_for_each_safe(pEntry, entry, &sa_cache_by_h[i], list_h)
 		{
-			//if((pEntry->direction == CDX_DPA_IPSEC_INBOUND) &&
-			//	(pEntry->id.spi == spi)) { 
-			if(pEntry->direction == CDX_DPA_IPSEC_INBOUND)
-			{
-				*sagd = pEntry->handle ;
+			if (pEntry->direction != CDX_DPA_IPSEC_INBOUND)
+				continue;
+
+			if (spi) {
+				if (pEntry->id.spi != be_spi)
+					continue;
+
+				*sagd = pEntry->handle;
 				return NO_ERR;
 			}
+
+			match = pEntry;
+			matches++;
 		}
+	}
+
+	if (match && matches == 1) {
+		*sagd = match->handle;
+		return NO_ERR;
 	}
 
 	return ERR_CT_ENTRY_INVALID_SA;

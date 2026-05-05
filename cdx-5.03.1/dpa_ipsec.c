@@ -2946,7 +2946,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 {
 	uint8_t *ptr;
 	uint32_t len;
-	struct sk_buff *skb;
+	struct sk_buff *skb = NULL;
 	struct net_device *net_dev;
 	struct dpa_bp *dpa_bp;
 	struct dpa_priv_s               *priv;
@@ -2954,7 +2954,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	unsigned short eth_type;
 	unsigned short sagd_pkt;
 	struct sec_path *sp;
-	struct xfrm_state *x;
+	struct xfrm_state *x = NULL;
 	struct timespec64 ktime;
 #ifdef DPA_IPSEC_DEBUG1
 	unsigned short sagd; 
@@ -3095,6 +3095,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	{
 		DPAIPSEC_ERROR("%s(%d) dpaa_eth_napi_schedule failed\n",
 				__FUNCTION__,__LINE__);
+		xfrm_state_put(x);
 		return qman_cb_dqrr_stop;
 	}
 #endif /* CONFIG_FSL_ASK_QMAN_PORTAL_NAPI */
@@ -3197,6 +3198,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 		x->curlft.use_time = (unsigned long)ktime.tv_sec;
 	}
 	sp->len = 1;
+	x = NULL;
 
 #ifdef DPA_IPSEC_DEBUG1
 	DPAIPSEC_INFO("%s::len %d ipsec_exception_pkt_cnt %d\n", 
@@ -3225,6 +3227,8 @@ pkt_drop:
 	if (skb) 
 		dev_kfree_skb(skb);
 rel_fd:
+	if (x)
+		xfrm_state_put(x);
 	if (!fd_released)
 		dpa_fd_release(net_dev, &dq->fd);
 	return qman_cb_dqrr_consume;
