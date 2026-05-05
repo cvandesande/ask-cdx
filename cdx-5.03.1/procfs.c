@@ -66,8 +66,8 @@ static ssize_t proc_fqid_stats_read(struct file *fp, char __user *buff, size_t s
 			 fqd->dest.wq);
 	len += scnprintf(kbuf + len, PAGE_SIZE - len, "contextb\t%x\n",
 			 fqd->context_b);
-	len += scnprintf(kbuf + len, PAGE_SIZE - len, "contexta\t%p\n",
-			 (void *)fqd->context_a.opaque);
+	len += scnprintf(kbuf + len, PAGE_SIZE - len, "contexta\t%llx\n",
+			 fqd->context_a.opaque);
 	if (qman_query_fq_np(fq_info, &np)) {
 		len += scnprintf(kbuf + len, PAGE_SIZE - len,
 				 "error getting fq fields\n");
@@ -181,7 +181,7 @@ int cdx_create_dir_in_procfs(void **proc_dir_entry, char *name,uint32_t type)
 #endif
 	*proc_dir_entry = (void *)proc_entry;
 #ifdef CDX_DPA_DEBUG
-	printk("%s()::%d proc_entry %p proc dir %p\n", __func__, __LINE__, proc_entry, proc_entry->proc_dir);
+	printk("%s()::%d proc_entry %px proc dir %px\n", __func__, __LINE__, proc_entry, proc_entry->proc_dir);
 #endif
 
 	return 0;
