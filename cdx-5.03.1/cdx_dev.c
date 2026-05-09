@@ -16,6 +16,7 @@
 #include <linux/device.h>
 #include "linux/ioctl.h"
 #include <linux/compat.h>
+#include <linux/kernel.h>
 #include <linux/uaccess.h>
 #include <linux/slab.h>
 #include <linux/fdtable.h>
@@ -55,21 +56,17 @@ static const struct file_operations cdx_dev_fops = {
 
 int cdx_ctrl_open(struct inode *inode, struct file *filp)
 {
-	//DPA_INFO("%s::\n", __FUNCTION__);
 	//allow only one open instance
-	if (!atomic_dec_and_test(&cdx_ctrl_open_count)) {
-		atomic_inc(&cdx_ctrl_open_count);
+	if (atomic_cmpxchg(&cdx_ctrl_open_count, 1, 0) != 1)
 		return -EBUSY;
-	}
 	return 0;
 }
 
 int cdx_ctrl_release(struct inode *inode, struct file *filp)
 {
 	//release open instance
-	//DPA_INFO("%s::\n", __FUNCTION__);
 	//TBD - recover resources here
-	atomic_inc(&cdx_ctrl_open_count);
+	atomic_set(&cdx_ctrl_open_count, 1);
 	return 0;
 }
 
@@ -143,54 +140,38 @@ static int __maybe_unused disp_muram(void)
 	return 0;
 }
 
+struct cdx_ioctl_spec {
+	unsigned int cmd;
+	long (*handle)(unsigned long args);
+};
+
+static long cdx_ioc_set_dpa_params_wrap(unsigned long args)
+{
+	return cdx_ioc_set_dpa_params(args);
+}
+
+static const struct cdx_ioctl_spec cdx_ioctl_table[] = {
+	{ CDX_CTRL_DPA_SET_PARAMS, cdx_ioc_set_dpa_params_wrap },
+#ifdef DPAA_DEBUG_ENABLE
+	{ CDX_CTRL_DPA_GET_MURAM_DATA, cdx_get_muram_data },
+#endif
+};
 
 long cdx_ctrl_ioctl(struct file *filp, unsigned int cmd,
                 unsigned long args) 
 {
-	int retval;
+	size_t i;
 
-	//DPA_INFO("%s::cmd %d\n", __FUNCTION__, cmd);
 	if (!capable(CAP_NET_ADMIN))
 		return -EPERM;
 
-	switch (cmd) {
-		case CDX_CTRL_DPA_SET_PARAMS:
-			retval = cdx_ioc_set_dpa_params(args);
-			break;
-
-		case CDX_CTRL_DPA_CONNADD:
-			//test conection addition
-			retval = cdx_ioc_dpa_connadd(args);
-			break;
-
-#ifdef DPAA_DEBUG_ENABLE
-		case CDX_CTRL_DPA_GET_MURAM_DATA:
-			//get muram contents
-			retval = cdx_get_muram_data(args);
-			break;
-#endif
-
-		case CDX_CTRL_DPA_QOS_CONFIG_ADD:
-			printk("%s::cdx_ioc_dpa_configqos not called\n", __FUNCTION__);
-			retval = 0;
-			break;
-
-		case CDX_CTRL_DPA_ADD_MCAST_GROUP:
-			retval = cdx_ioc_create_mc_group(args);
-			break;
-		case CDX_CTRL_DPA_ADD_MCAST_MEMBER:
-			retval = cdx_ioc_add_member_to_group(args);
-			break;
-		case CDX_CTRL_DPA_ADD_MCAST_TABLE_ENTRY:
-			retval = cdx_ioc_add_mcast_table_entry(args);
-			break;
-		default:
-			DPA_ERROR("%s::unsupported ioctl cmd %x\n", 
-					__FUNCTION__, cmd);
-			retval = -EINVAL;
-			break;
+	for (i = 0; i < ARRAY_SIZE(cdx_ioctl_table); i++) {
+		if (cdx_ioctl_table[i].cmd == cmd)
+			return cdx_ioctl_table[i].handle(args);
 	}
-	return retval;
+
+	DPA_ERROR("%s::unsupported ioctl cmd %x\n", __func__, cmd);
+	return -ENOTTY;
 }
 
 #ifdef CONFIG_COMPAT
@@ -201,7 +182,7 @@ long cdx_ctrl_compat_ioctl(struct file *filp, unsigned int cmd,
 	if (!capable(CAP_NET_ADMIN))
 		return -EPERM;
 
-	return -EINVAL;
+	return -ENOTTY;
 }
 #endif
 
@@ -250,5 +231,4 @@ int cdx_driver_init(void)
 	register_cdx_deinit_func(cdx_driver_deinit);
 	return 0;
 }
-
 

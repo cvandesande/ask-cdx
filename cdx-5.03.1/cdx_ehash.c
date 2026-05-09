@@ -1190,6 +1190,7 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 #ifdef CDX_DPA_DEBUG
 	display_ehash_tbl_entry(&tbl_entry->hashentry, key_size);
 #endif // CDX_DPA_DEBUG
+	wmb();
 	//insert entry into hash table
 	retval = ExternalHashTableAddKey(info->td, key_size, tbl_entry); 
 	if (retval == -1) {

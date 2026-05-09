@@ -12,6 +12,8 @@
 #ifndef _CONTROL_TUNNEL_H_
 #define _CONTROL_TUNNEL_H_
 
+#include <linux/types.h>
+
 #include "cdx_common.h"
 #include "control_ipv4.h"
 
@@ -188,13 +190,15 @@ U16 Tnl_Get_Next_Hash_Entry(PTNLCommand_query pTnlCmd, int reset_action);
 int dpa_add_tunnel_if(itf_t *itf, itf_t *phys_itf, PTnlEntry pTunnelEntry);
 int dpa_update_tunnel_if(itf_t *itf,  itf_t *phys_itf, PTnlEntry pTunnelEntry);
 
-static __inline U32 HASH_TUNNEL_NAME(U8 *tnlname)
+static __inline U32 HASH_TUNNEL_NAME(const U8 *tnlname, size_t maxlen)
 {
 	U32 hash = 0;
-	while (*tnlname)
+	size_t i;
+
+	for (i = 0; i < maxlen && tnlname[i]; i++)
 	{
 		hash <<= 3;
-		hash ^= *tnlname++;
+		hash ^= tnlname[i];
 	}
 	return (hash & TUNNEL_HASH_MASK);
 }

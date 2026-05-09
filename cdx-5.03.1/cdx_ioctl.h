@@ -27,7 +27,6 @@
 #define CDX_CTRL_MAX_FMANS		2
 #define CDX_CTRL_MAX_PORTS_PER_FMAN	5
 #define CDX_CTRL_MAX_TABLES_PER_FMAN	64
-#define CDX_CTRL_MAX_TEST_CONN		1024
 
 //table create ioctl
 #define CDX_CTRL_TBL_NAME_LEN	64
@@ -228,45 +227,6 @@ struct cdx_ctrl_set_dpa_params {
 #define CDX_CTRL_DPA_SET_PARAMS\
         _IOWR(CDX_IOC_MAGIC, 1, struct cdx_ctrl_set_dpa_params)
 
-//flow add ioctl structures, used only by test code
-struct test_flow_info {
-	uint16_t sport;		//source port for tcp/udp conn
-	uint16_t dport;		//dest port for tcp/udp conn
-	uint16_t mtu;		//mtu to be used
-	char *ingress_port;	//packets ingress iface name
-	char *egress_port;	//packets egress iface name
-	char dest_mac[6];	//dest gw mac address
-	union {
-		struct {
-			uint32_t ipv4_saddr;	//ipv4 source addr
-			uint32_t ipv4_daddr;	//ipv4 dest addr
-		};
-		struct {
-			uint8_t ipv6_saddr[16];	//ipv6 src addr
-			uint8_t ipv6_daddr[16];	//ipv6 dest addr
-		};
-	};
-};
-
-
-//per connection info
-struct test_conn_info {
-	uint32_t flags;                 //mapped to CTentry status flags
-	uint8_t proto;                  //protocol - udp, tcp, icmp etc
-	struct test_flow_info fwd_flow; //forward flow info
-	struct test_flow_info rev_flow; //rev flow info
-};
-
-
-//structure used by CDX_CTRL_DPA_CONNADD call
-struct add_conn_info {
-	uint32_t num_conn;                //num conn to add
-	struct test_conn_info *conn_info; //pointer to array of connections
-};
-
-#define CDX_CTRL_DPA_CONNADD\
-        _IOWR(CDX_IOC_MAGIC, 3, struct add_conn_info)
-
 #ifdef DPAA_DEBUG_ENABLE
 struct muram_data {
         uint8_t *buff;
@@ -277,78 +237,7 @@ struct muram_data {
         _IOWR(CDX_IOC_MAGIC, 4, struct muram_data)
 #endif
 
-struct QoSConfig_Info
-{
-  char If_info[12];
-  unsigned int uiCIR;
-  unsigned int uiEIR;
-  unsigned int uiCBS;
-  unsigned int uiEBS;
-  short int uiNoOfSchedulers;
-  short int uiNoOfQueues;
-  int sp; /*Strict priority algorithm*/
-} ; 
-
-#define CDX_CTRL_DPA_QOS_CONFIG_ADD\
-        _IOWR(CDX_IOC_MAGIC, 3, struct QoSConfig_Info)
-struct add_mc_group_info
-{
-   union
-   {
-     struct
-     {
-       uint32_t ipv4_saddr;	//ipv4 source addr
-       uint32_t ipv4_daddr;	//ipv4 dest addr
-     };
-     struct
-     {
-       uint8_t ipv6_saddr[16];	//ipv6 src addr
-       uint8_t ipv6_daddr[16];	//ipv6 dest addr
-     };
-   };
-   char ucListenerPort[32]; /* Interface name on which multicast packet need to be sent out*/
-   uint8_t uiMaxMembers; /*Max listeners for this group*/
-   uint8_t mctype; /* 0  for v4 and 1 for v6*/
-};
-
-#define CDX_CTRL_DPA_ADD_MCAST_GROUP\
-        _IOWR(CDX_IOC_MAGIC, 5, struct add_mc_group_info)
-
-struct dpa_member_to_mcast_group
-{
-  uint8_t mcast_grp;
-  char ucListenerPort[32];
-};
-
-#define CDX_CTRL_DPA_ADD_MCAST_MEMBER\
-        _IOWR(CDX_IOC_MAGIC, 6, struct add_mc_group_info)
-
-struct add_mc_entry_info
-{
-   union
-   {
-     struct
-     {
-       uint32_t ipv4_saddr;	//ipv4 source addr
-       uint32_t ipv4_daddr;	//ipv4 dest addr
-     };
-     struct
-     {
-       uint8_t ipv6_saddr[16];	//ipv6 src addr
-       uint8_t ipv6_daddr[16];	//ipv6 dest addr
-     };
-   };
-   char ucIngressPort[32];
-   uint8_t mctype; /* 0  for v4 and 1 for v6*/
-};
-#define CDX_CTRL_DPA_ADD_MCAST_TABLE_ENTRY\
-        _IOWR(CDX_IOC_MAGIC, 7, struct add_mc_entry_info)
-
 int cdx_ioc_set_dpa_params(unsigned long args);
-int cdx_ioc_dpa_connadd(unsigned long args);
-int cdx_ioc_create_mc_group(unsigned long args);
-int cdx_ioc_add_member_to_group(unsigned long args);
-int cdx_ioc_add_mcast_table_entry(unsigned long args);
 
 int cdx_driver_init(void);
 int cdxdrv_init_stats(void *muram_handle);

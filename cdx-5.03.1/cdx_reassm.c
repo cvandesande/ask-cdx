@@ -37,6 +37,7 @@
 #include "control_pppoe.h"
 #include "control_socket.h"
 #include "module_rtp_relay.h"
+#include "procfs.h"
 
 //#define CDX_IPR_DEBUG 1
 
@@ -61,6 +62,9 @@ static struct port_bman_pool_info reassly_frag_parent_pool_info;
 struct dpa_bp *ipr_frag_bp;
 //reassmebly timer tick task
 static struct task_struct *ipr_timer_thread;
+static struct dpa_fq **ipr_fqs;
+static uint32_t ipr_num_fqs;
+static uint32_t ipr_fqid_base;
 
 
 //IP reassembly timer frequency
@@ -139,21 +143,33 @@ static enum qman_cb_dqrr_result __hot ipr_buff_release_dqrr(
 	}
 	list = (struct ip_reassembly_frag_list *)bufstart;
 	num_entries = list->num_entries;
+	if (num_entries > reassly_bp->size / sizeof(*list)) {
+		DPA_ERROR("%s::bogus num_entries %u (max %u), dropping frame\n",
+				__func__, num_entries,
+				(uint32_t)(reassly_bp->size / sizeof(*list)));
+		return qman_cb_dqrr_consume;
+	}
 #ifdef CDX_IPR_DEBUG	
 	CDX_IPR_DPRINT("list %llx, refcount %d, entries %d\n",
 			addr, list->ref_count, num_entries);
 	for (ii = 0; ii < num_entries; ii++)
 	{	
 		uint32_t bpid;
+		dma_addr_t frag_addr;
 		display_buff_data((uint8_t *)(list + ii), 
 				sizeof(struct ip_reassembly_frag_list));
-		addr = (list + ii)->addr_hi;
-		addr <<= 32;
-		addr |= cpu_to_be32((list + ii)->addr_lo); 
-		bpid = cpu_to_be16((list + ii)->bpid);
-		CDX_IPR_DPRINT("addr %llx, bpid %d\n", addr, bpid);
+		frag_addr = (list + ii)->addr_hi;
+		frag_addr <<= 32;
+		frag_addr |= be32_to_cpu((list + ii)->addr_lo);
+		bpid = be16_to_cpu((list + ii)->bpid);
+		CDX_IPR_DPRINT("addr %llx, bpid %d\n", frag_addr, bpid);
 	}	
 #endif
+	if (list->ref_count == 0) {
+		DPA_ERROR("%s::ref_count underflow on ctx %llx\n",
+				__func__, (unsigned long long)addr);
+		return qman_cb_dqrr_consume;
+	}
 	list->ref_count--;
 #ifdef CDX_IPR_DEBUG	
 	CDX_IPR_DPRINT("refcount %d\n",
@@ -165,11 +181,11 @@ static enum qman_cb_dqrr_result __hot ipr_buff_release_dqrr(
 		for (ii = 0; ii < num_entries; ii++) {
 			struct dpa_bp *bp;
 			struct bm_buffer buf;
-			buf.bpid = cpu_to_be16(list->bpid);
+			buf.bpid = be16_to_cpu(list->bpid);
 			bp = ipr_bpid2pool(buf.bpid);
 			if (bp) {
 				buf.hi = list->addr_hi;
-				buf.lo = cpu_to_be32(list->addr_lo);
+				buf.lo = be32_to_cpu(list->addr_lo);
 				//free members to pool
 #ifdef CDX_IPR_DEBUG	
 				CDX_IPR_DPRINT("releasing addr %x%08x to bpid %d "
@@ -190,6 +206,39 @@ static enum qman_cb_dqrr_result __hot ipr_buff_release_dqrr(
 	return qman_cb_dqrr_consume;
 }
 
+static void cdx_destroy_ipr_fqs(void)
+{
+	uint32_t ii;
+
+	if (!ipr_fqs)
+		return;
+
+	for (ii = 0; ii < ipr_num_fqs; ii++) {
+		struct qman_fq *fq;
+
+		if (!ipr_fqs[ii])
+			continue;
+
+		fq = &ipr_fqs[ii]->fq_base;
+		if (qman_retire_fq(fq, NULL))
+			DPA_ERROR("%s::failed to retire fqid %d\n",
+					__func__, fq->fqid);
+		if (qman_oos_fq(fq))
+			DPA_ERROR("%s::failed to oos fqid %d\n",
+					__func__, fq->fqid);
+		cdx_remove_fqid_info_in_procfs(fq->fqid);
+		qman_destroy_fq(fq, 0);
+		kfree(ipr_fqs[ii]);
+		ipr_fqs[ii] = NULL;
+	}
+
+	if (ipr_num_fqs)
+		qman_release_fqid_range(ipr_fqid_base, ipr_num_fqs);
+	kfree(ipr_fqs);
+	ipr_fqs = NULL;
+	ipr_num_fqs = 0;
+	ipr_fqid_base = 0;
+}
 
 static int cdx_create_ipr_fq(uint32_t *base_fqid)
 {
@@ -227,6 +276,14 @@ static int cdx_create_ipr_fq(uint32_t *base_fqid)
 				__FUNCTION__);
 		return -1;
 	}
+	ipr_fqs = kcalloc(num_portals, sizeof(*ipr_fqs), GFP_KERNEL);
+	if (!ipr_fqs) {
+		DPA_ERROR("%s::no mem for ipr fq tracking\n", __func__);
+		qman_release_fqid_range(fqid_base, num_portals);
+		return -1;
+	}
+	ipr_fqid_base = fqid_base;
+	ipr_num_fqs = num_portals;
 #ifdef DEVMAN_DEBUG
 	CDX_IPR_DPRINT("%s::fqid_base %x(%d), num %d\n",
 			__FUNCTION__, fqid_base, fqid_base, num_portals);
@@ -239,9 +296,9 @@ static int cdx_create_ipr_fq(uint32_t *base_fqid)
 			if (!dpa_fq) {
 				DPA_ERROR("%s::unable to alloc mem for "
 						"fqid %d\n", __FUNCTION__, fqid);
+				cdx_destroy_ipr_fqs();
 				return -1;
 			}
-			memset(dpa_fq, 0, sizeof(struct dpa_fq));
 			dpa_fq->fqid = fqid;
 			dpa_fq->fq_type = FQ_TYPE_RX_PCD;
 			//round robin channel ids
@@ -257,8 +314,10 @@ static int cdx_create_ipr_fq(uint32_t *base_fqid)
 				DPA_ERROR("%s::cdx_create_fq failed for "
 						"fqid %d\n", __FUNCTION__, fqid);
 				kfree(dpa_fq);
+				cdx_destroy_ipr_fqs();
 				return -1;
 			}
+			ipr_fqs[ii] = dpa_fq;
 			add_pcd_fq_info(dpa_fq);
 #ifdef DEVMAN_DEBUG
 			CDX_IPR_DPRINT("%s::fqid 0x%x created chnl 0x%x\n", 
@@ -373,10 +432,29 @@ static int ipr_timer(void *data)
 	return 0;
 }
 
+static void free_ipr_bpool(struct dpa_bp **bp_slot)
+{
+	struct dpa_bp *bp = *bp_slot;
+
+	if (!bp)
+		return;
+
+	_dpa_bp_free(bp);
+	kfree(bp);
+	*bp_slot = NULL;
+}
+
 static void cdx_deinit_ip_reassembly(void)
 {
-	printk("%s::implement this\n", __FUNCTION__);
-	return;
+	register_dpaa_eth_bpool_replenish_hook(NULL);
+
+	if (ipr_timer_thread && !IS_ERR(ipr_timer_thread)) {
+		kthread_stop(ipr_timer_thread);
+		ipr_timer_thread = NULL;
+	}
+	cdx_destroy_ipr_fqs();
+	free_ipr_bpool(&ipr_frag_bp);
+	free_ipr_bpool(&reassly_bp);
 }
 
 int cdx_init_ip_reassembly(void)
@@ -384,6 +462,7 @@ int cdx_init_ip_reassembly(void)
 	struct dpa_bp *bp_parent;
 	uint32_t fqid; 
 	int num_fqs;
+	int ret;
 
 	printk("%s::\n", __FUNCTION__);
 	//find pools used by ethernet devices and borrow buffers from it
@@ -411,7 +490,9 @@ int cdx_init_ip_reassembly(void)
 	if (IS_ERR(ipr_timer_thread))
 	{
 		DPA_ERROR(KERN_ERR "%s: kthread_create() failed\n", __func__);
-		return -1;
+		ret = -1;
+		ipr_timer_thread = NULL;
+		goto err_free_ctx_bp;
 	}
 	CDX_IPR_DPRINT("%s::created ipr timer thread %p\n", __FUNCTION__,
 			ipr_timer_thread);
@@ -423,7 +504,8 @@ int cdx_init_ip_reassembly(void)
 				&reassly_frag_parent_pool_info)) {
 		DPA_ERROR("%s::failed to locate eth bman pool for frag buffs\n", 
 				__FUNCTION__);
-		return -1;
+		ret = -1;
+		goto err_stop_kthread;
 	}
 	bp_parent = dpa_bpid2pool(reassly_frag_parent_pool_info.pool_id);
 	CDX_IPR_DPRINT("%s::parent bman pool for reassly - bp %p, bpid %d paddr %lx vaddr %p dev %p\n", 
@@ -436,13 +518,15 @@ int cdx_init_ip_reassembly(void)
 	if (!ipr_frag_bp) {
 		DPA_ERROR("%s::failed to create pool for ipr fragments\n", 
 				__FUNCTION__);
-		return -1;
+		ret = -1;
+		goto err_stop_kthread;
 	}
 	num_fqs = cdx_create_ipr_fq(&fqid);
 	if (num_fqs == -1) {
 		DPA_ERROR("%s::unable to create txconf fqids for IPV4_REASSM\n", 
 				__FUNCTION__);
-		return -1;
+		ret = -1;
+		goto err_free_frag_bp;
 	}
 	CDX_IPR_DPRINT("%s::ipr txconf fqbase %x(%d), num fqs %d\n",
 			__FUNCTION__, fqid, fqid, num_fqs);
@@ -454,9 +538,10 @@ int cdx_init_ip_reassembly(void)
 				ipr_frag_bp->size, 
 				fqid,
 				IPR_TIMER_FREQUENCY)) {
-		DPA_ERROR("%s::unable to set bpid for IPV4_REASSM_TABLE\n", 
+		DPA_ERROR("%s::unable to set bpid for IPV4_REASSM_TABLE\n",
 				__FUNCTION__);
-		return -1;
+		ret = -1;
+		goto err_destroy_ipr_fqs;
 	}	
 	if (ExternalHashSetReasslyPool(IPV6_REASSM_TABLE , 
 				reassly_bp->bpid, 
@@ -465,14 +550,26 @@ int cdx_init_ip_reassembly(void)
 				ipr_frag_bp->size, 
 				fqid,
 				IPR_TIMER_FREQUENCY)) {
-		DPA_ERROR("%s::unable to set bpid for IPV4_REASSM_TABLE\n", 
+		DPA_ERROR("%s::unable to set bpid for IPV4_REASSM_TABLE\n",
 				__FUNCTION__);
-		return -1;
+		ret = -1;
+		goto err_destroy_ipr_fqs;
 	}
 	//register hook to replenish frag buffer pool
 	register_dpaa_eth_bpool_replenish_hook(replenish_ipr_frag_pool);	
 	register_cdx_deinit_func(cdx_deinit_ip_reassembly);
 	return 0;
+
+err_destroy_ipr_fqs:
+	cdx_destroy_ipr_fqs();
+err_free_frag_bp:
+	free_ipr_bpool(&ipr_frag_bp);
+err_stop_kthread:
+	kthread_stop(ipr_timer_thread);
+	ipr_timer_thread = NULL;
+err_free_ctx_bp:
+	free_ipr_bpool(&reassly_bp);
+	return ret;
 }
 
 int cdx_get_ipr_v4_stats(void *resp)
@@ -495,4 +592,3 @@ int cdx_get_ipr_v6_stats(void *resp)
 		return -1;	
 	return (sizeof(struct ipr_statistics));
 }
-

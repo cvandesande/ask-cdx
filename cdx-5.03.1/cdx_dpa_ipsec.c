@@ -210,11 +210,11 @@ void cdx_ipsec_sec_sa_context_free(PDpaSecSAContext pdpa_sec_context )
 	if(pdpa_sec_context->dpa_ipsecsa_handle)
 		cdx_dpa_ipsecsa_release(pdpa_sec_context->dpa_ipsecsa_handle);
 	if(pdpa_sec_context->cipher_data.cipher_key)
-		kfree(pdpa_sec_context->cipher_data.cipher_key);
+		kfree_sensitive(pdpa_sec_context->cipher_data.cipher_key);
 	if(pdpa_sec_context->auth_data.auth_key)
-		kfree(pdpa_sec_context->auth_data.auth_key);
+		kfree_sensitive(pdpa_sec_context->auth_data.auth_key);
 	if(pdpa_sec_context->auth_data.split_key)
-		kfree(pdpa_sec_context->auth_data.split_key); 
+		kfree_sensitive(pdpa_sec_context->auth_data.split_key);
 	if(pdpa_sec_context->sec_desc_extra_cmds_unaligned)
 		kfree(pdpa_sec_context->sec_desc_extra_cmds_unaligned);
 	if(pdpa_sec_context->rjob_desc_unaligned)
@@ -2048,13 +2048,14 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 		}
 	}
 
-	crypto_key_dma = dma_map_single(jrdev_g, 
+	crypto_key_dma = dma_map_single(jrdev_g,
 			psec_sa_context->cipher_data.cipher_key,
 			psec_sa_context->cipher_data.cipher_key_len,
 			DMA_TO_DEVICE);
 	if (!crypto_key_dma) {
 		log_err("Could not DMA map cipher key\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto err_unmap_auth;
 	}
 
 	/*
@@ -2078,7 +2079,8 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 			goto build_extended_shared_desc;
 		default:
 			log_err("Failed to create SEC descriptor for SA with   spi %d\n", sa->id.spi);
-			return -EFAULT;
+			ret = -EFAULT;
+			goto err_unmap_crypto;
 	}
 
 build_extended_shared_desc:
@@ -2096,7 +2098,8 @@ build_extended_shared_desc:
 	if (ret < 0) {
 		log_err("Failed to create SEC descriptor for SA with spi %d\n", 
 				sa->id.spi);
-		return -EFAULT;
+		ret = -EFAULT;
+		goto err_unmap_crypto;
 	}
 
 done_shared_desc:
@@ -2120,17 +2123,17 @@ done_shared_desc:
 	//	(void *)sec_desc->preheader);
 	sec_desc->preheader = cpu_to_caam64(sec_desc->preheader);
 
+	dma_unmap_single(jrdev_g, crypto_key_dma,
+			psec_sa_context->cipher_data.cipher_key_len,
+			DMA_TO_DEVICE);
 	if (psec_sa_context->auth_data.split_key_pad_len)
 		dma_unmap_single(jrdev_g, auth_key_dma,
-				psec_sa_context->auth_data.split_key_pad_len, 
+				psec_sa_context->auth_data.split_key_pad_len,
 				DMA_TO_DEVICE);
 	else if (psec_sa_context->auth_data.auth_key_len)
 		dma_unmap_single(jrdev_g, auth_key_dma,
-				psec_sa_context->auth_data.auth_key_len, 
+				psec_sa_context->auth_data.auth_key_len,
 				DMA_TO_DEVICE);
-	dma_unmap_single(jrdev_g, crypto_key_dma,
-			psec_sa_context->cipher_data.cipher_key_len, 
-			DMA_TO_DEVICE);
 	shared_desc_dma = dma_map_single(jrdev_g, sec_desc,
 			sizeof(struct sec_descriptor),
 			DMA_TO_DEVICE);
@@ -2138,6 +2141,21 @@ done_shared_desc:
 			sizeof(struct sec_descriptor),
 			DMA_TO_DEVICE);
 	return 0;
+
+err_unmap_crypto:
+	dma_unmap_single(jrdev_g, crypto_key_dma,
+			psec_sa_context->cipher_data.cipher_key_len,
+			DMA_TO_DEVICE);
+err_unmap_auth:
+	if (psec_sa_context->auth_data.split_key_pad_len)
+		dma_unmap_single(jrdev_g, auth_key_dma,
+				psec_sa_context->auth_data.split_key_pad_len,
+				DMA_TO_DEVICE);
+	else if (psec_sa_context->auth_data.auth_key_len)
+		dma_unmap_single(jrdev_g, auth_key_dma,
+				psec_sa_context->auth_data.auth_key_len,
+				DMA_TO_DEVICE);
+	return ret;
 }
 
 static void split_key_done(struct device *dev, u32 *desc, u32 err,
@@ -2418,7 +2436,7 @@ int cdx_ipsec_process_udp_classification_table_entry(PSAEntry sa)
 			natt_tbl_entry = (struct en_exthash_tbl_entry *)sa->ct->handle;
 			ipsec_preempt_params = (struct en_ehash_ipsec_preempt_op*) natt_tbl_entry->ipsec_preempt_params;
 			arr_index = get_free_natt_arr_index(be16_to_cpu(ipsec_preempt_params->natt_arr_mask));
-			if (arr_index > MAX_SPI_PER_FLOW)
+			if (arr_index >= MAX_SPI_PER_FLOW)
 				goto err_ret;
 			sa->ct->natt_in_refcnt++;
 			ipsec_preempt_params->spi_param[arr_index].spi = sa->id.spi;
