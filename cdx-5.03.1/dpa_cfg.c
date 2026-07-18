@@ -772,10 +772,26 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 		retval = -ENOMEM;
 		goto err_ret;
 	}
+	/*
+	 * release_cfg_info() only owns kernel allocations. Every entry's
+	 * portinfo/tbl_info currently holds a raw userspace pointer from the
+	 * copy_from_user() above. Save those pointers and clear the fields
+	 * for the whole array up front -- before the validation loop below
+	 * can goto err_ret on any single entry -- so no unwind path (whether
+	 * the failing entry itself or any entry after it that the loop never
+	 * reaches) ever leaves a userspace pointer for release_cfg_info() to
+	 * dereference as a kernel pointer.
+	 */
 	finfo = fman_info;
 	for (ii = 0; ii < num_fmans; ii++) {
 		uspace_portinfo[ii] = (struct cdx_port_info __user *)finfo->portinfo;
 		uspace_tbl_info[ii] = (struct table_info __user *)finfo->tbl_info;
+		finfo->portinfo = NULL;
+		finfo->tbl_info = NULL;
+		finfo++;
+	}
+	finfo = fman_info;
+	for (ii = 0; ii < num_fmans; ii++) {
 		if (finfo->index >= CDX_CTRL_MAX_FMANS ||
 		    !finfo->max_ports ||
 		    finfo->max_ports > CDX_CTRL_MAX_PORTS_PER_FMAN ||
@@ -785,13 +801,6 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 			retval = -EINVAL;
 			goto err_ret;
 		}
-		/*
-		 * release_cfg_info() only owns kernel allocations. Clear the
-		 * copied userspace pointers here so early unwind paths never
-		 * hand them to kfree().
-		 */
-		finfo->portinfo = NULL;
-		finfo->tbl_info = NULL;
 		finfo++;
 	}
 	//init the fman handles 
