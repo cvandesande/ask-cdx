@@ -17,6 +17,7 @@
 #include <linux/kernel.h>
 #include <linux/gfp.h>
 #include <linux/slab.h>
+#include <linux/mm.h>
 #include <linux/fsl_qman.h>
 #include <linux/fsl_bman.h>
 #include <linux/netdevice.h>
@@ -408,6 +409,11 @@ struct net_device *find_osdev_by_fman_params(uint32_t fm_idx, uint32_t port_idx,
 			priv = netdev_priv(device);
 			macdev = priv->mac_dev;
 			if (macdev) {
+				if (!virt_addr_valid(macdev)) {
+					pr_err("cdx: find_osdev_by_fman_params: %s type=%u has bogus mac_dev %px (fm_idx=%u port_idx=%u speed=%u), skipping\n",
+						device->name, device->type, macdev, fm_idx, port_idx, speed);
+					goto next_device;
+				}
 				p_LnxWrpFmDev = (t_LnxWrpFmDev*)macdev->fm;
 				if (speed == 10) {
 					//10 gig interfaces upports only SUPPORTED_10000baseT_Full
