@@ -255,11 +255,20 @@ static int get_dist_info(struct cdx_port_info *port_info, void __user *uspace_in
 		return 0;
 	}
 
-	if (port_info->max_dist > CDX_CTRL_MAX_DIST_PER_PORT)
+	if (port_info->max_dist > CDX_CTRL_MAX_DIST_PER_PORT) {
+		DPA_ERROR("%s::port %s max_dist %u > CDX_CTRL_MAX_DIST_PER_PORT %u\n",
+				__FUNCTION__, port_info->name,
+				(uint32_t)port_info->max_dist,
+				(uint32_t)CDX_CTRL_MAX_DIST_PER_PORT);
 		return -EINVAL;
+	}
 
-	if (!uspace_info)
+	if (!uspace_info) {
+		DPA_ERROR("%s::port %s max_dist %u but null uspace dist_info\n",
+				__FUNCTION__, port_info->name,
+				(uint32_t)port_info->max_dist);
 		return -EINVAL;
+	}
 
 	dist_info = kcalloc(port_info->max_dist, sizeof(*dist_info), GFP_KERNEL);
 	if (!dist_info) {
@@ -355,11 +364,19 @@ static int get_port_info(struct cdx_fman_info *finfo, void __user *uspace_info)
 	uint32_t ii;
 
 	//allocate port information area
-	if (!finfo->max_ports || finfo->max_ports > CDX_CTRL_MAX_PORTS_PER_FMAN)
+	if (!finfo->max_ports || finfo->max_ports > CDX_CTRL_MAX_PORTS_PER_FMAN) {
+		DPA_ERROR("%s::fm %u max_ports %u outside 1..%u\n",
+				__FUNCTION__, (uint32_t)finfo->index,
+				(uint32_t)finfo->max_ports,
+				(uint32_t)CDX_CTRL_MAX_PORTS_PER_FMAN);
 		return -EINVAL;
+	}
 
-	if (!uspace_info)
+	if (!uspace_info) {
+		DPA_ERROR("%s::fm %u null uspace port_info\n",
+				__FUNCTION__, (uint32_t)finfo->index);
 		return -EINVAL;
+	}
 
 #ifdef DPA_CFG_DEBUG
 	DPA_INFO("%s::fm %d num ports %d\n", __FUNCTION__, 
@@ -391,6 +408,16 @@ static int get_port_info(struct cdx_fman_info *finfo, void __user *uspace_info)
 		if (port_info[ii].fm_index >= CDX_CTRL_MAX_FMANS ||
 		    port_info[ii].max_dist > CDX_CTRL_MAX_DIST_PER_PORT ||
 		    (port_info[ii].max_dist && !uspace_dist_info[ii])) {
+			DPA_ERROR("%s::port %u \"%s\" rejected: fm_index %u "
+					"(max %u), type %u, max_dist %u "
+					"(max %u), dist_info %s\n",
+					__FUNCTION__, ii, port_info[ii].name,
+					(uint32_t)port_info[ii].fm_index,
+					(uint32_t)CDX_CTRL_MAX_FMANS,
+					(uint32_t)port_info[ii].type,
+					(uint32_t)port_info[ii].max_dist,
+					(uint32_t)CDX_CTRL_MAX_DIST_PER_PORT,
+					uspace_dist_info[ii] ? "set" : "NULL");
 			kfree(uspace_dist_info);
 			return -EINVAL;
 		}
@@ -441,11 +468,19 @@ static int get_cctbl_info(struct cdx_fman_info *finfo, void __user *uspace_info)
 	struct table_info *tbl_info;
 
 	//allocate table information area
-	if (!finfo->num_tables || finfo->num_tables > CDX_CTRL_MAX_TABLES_PER_FMAN)
+	if (!finfo->num_tables || finfo->num_tables > CDX_CTRL_MAX_TABLES_PER_FMAN) {
+		DPA_ERROR("%s::fm %u num_tables %u outside 1..%u\n",
+				__FUNCTION__, (uint32_t)finfo->index,
+				(uint32_t)finfo->num_tables,
+				(uint32_t)CDX_CTRL_MAX_TABLES_PER_FMAN);
 		return -EINVAL;
+	}
 
-	if (!uspace_info)
+	if (!uspace_info) {
+		DPA_ERROR("%s::fm %u null uspace tbl_info\n",
+				__FUNCTION__, (uint32_t)finfo->index);
 		return -EINVAL;
+	}
 
 	tbl_info = kcalloc(finfo->num_tables, sizeof(*tbl_info), GFP_KERNEL);
 	if (!tbl_info) {
@@ -729,8 +764,10 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 	uint32_t ii;	
 	int retval;
 
-	if (!args)
+	if (!args) {
+		DPA_ERROR("%s::null args\n", __FUNCTION__);
 		return -EINVAL;
+	}
 
 	if (copy_from_user(&params, (void *)args, 
 				sizeof(struct cdx_ctrl_set_dpa_params))) {
@@ -738,12 +775,22 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 				__FUNCTION__);
 		return -EBUSY;
 	}
-	if (fman_info || num_fmans)
+	if (fman_info || num_fmans) {
+		DPA_ERROR("%s::already configured, num_fmans %u\n",
+				__FUNCTION__, num_fmans);
 		return -EBUSY;
+	}
 
 	if (!params.num_fmans || params.num_fmans > CDX_CTRL_MAX_FMANS ||
-	    !params.fman_info || !params.ipr_info)
+	    !params.fman_info || !params.ipr_info) {
+		DPA_ERROR("%s::rejected: num_fmans %u (max %u), fman_info %s, "
+				"ipr_info %s\n", __FUNCTION__,
+				(uint32_t)params.num_fmans,
+				(uint32_t)CDX_CTRL_MAX_FMANS,
+				params.fman_info ? "set" : "NULL",
+				params.ipr_info ? "set" : "NULL");
 		return -EINVAL;
+	}
 
 	fman_info = kcalloc(params.num_fmans, sizeof(*fman_info), GFP_KERNEL);
 	if (!fman_info) {
@@ -808,6 +855,18 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 		    !finfo->num_tables ||
 		    finfo->num_tables > CDX_CTRL_MAX_TABLES_PER_FMAN ||
 		    !uspace_portinfo[ii] || !uspace_tbl_info[ii]) {
+			DPA_ERROR("%s::fman %u rejected: index %u (max %u), "
+					"max_ports %u (max %u), num_tables %u "
+					"(max %u), portinfo %s, tbl_info %s\n",
+					__FUNCTION__, ii,
+					(uint32_t)finfo->index,
+					(uint32_t)CDX_CTRL_MAX_FMANS,
+					(uint32_t)finfo->max_ports,
+					(uint32_t)CDX_CTRL_MAX_PORTS_PER_FMAN,
+					(uint32_t)finfo->num_tables,
+					(uint32_t)CDX_CTRL_MAX_TABLES_PER_FMAN,
+					uspace_portinfo[ii] ? "set" : "NULL",
+					uspace_tbl_info[ii] ? "set" : "NULL");
 			retval = -EINVAL;
 			goto err_ret;
 		}
@@ -817,6 +876,8 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 	finfo = fman_info;
 	for (ii = 0; ii < num_fmans; ii++) {
 		if (cdxdrv_get_fman_handles(finfo)) {
+			DPA_ERROR("%s::cdxdrv_get_fman_handles failed for fman %u\n",
+					__FUNCTION__, ii);
 			retval = -EIO;
 			goto err_ret;
 		}
@@ -825,6 +886,7 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 	finfo = fman_info;
 	//init interface stats module
 	if (cdxdrv_init_stats(finfo->muram_handle)) {
+		DPA_ERROR("%s::cdxdrv_init_stats failed\n", __FUNCTION__);
 		retval = -EIO;
 		goto err_ret;
 	}
@@ -883,11 +945,14 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 	}
 
 	if (cdx_create_port_fqs()) {
+		DPA_ERROR("%s::cdx_create_port_fqs failed\n", __FUNCTION__);
 		retval = -EIO;
 		goto err_ret;
 	}
 	//create cp rate limit policier profiles
 	if (cdxdrv_create_missaction_policer_profiles(fman_info)) {
+		DPA_ERROR("%s::cdxdrv_create_missaction_policer_profiles failed\n",
+				__FUNCTION__);
 		retval = -EIO;
 		goto err_ret;
 	}
@@ -906,6 +971,8 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 	//init the fman and its ports
 	for (ii = 0; ii < num_fmans; ii++) {
 		if (cdxdrv_set_miss_action(ii)) {
+			DPA_ERROR("%s::cdxdrv_set_miss_action failed for fman %u\n",
+					__FUNCTION__, ii);
 			retval = -EIO;
 			goto err_ret;
 		}
