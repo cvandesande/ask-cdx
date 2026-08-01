@@ -188,7 +188,17 @@ int  get_tableInfo_by_portid( int fm_index, int portid,  void **td,  int * flags
 	finfo = &fman_info[fm_index];	
 	tinfo = finfo->tbl_info;
 	for (jj = 0; jj < finfo->num_tables; jj++) {
-		if(tinfo->port_idx  == (1<< portid))
+		/*
+		 * port_idx is a bitmap of every port that references this
+		 * table, built by dpa_app as
+		 *	tbl_info->port_idx |= (1 << port->portid)
+		 * over all ports (create_tbl_portmap()). Every classification
+		 * in cdx_pcd.xml is shared="true", so a table reachable from
+		 * more than one port has more than one bit set and an equality
+		 * test never matches. Test for membership, as the sibling
+		 * lookup dpa_get_tdinfo() already does.
+		 */
+		if (tinfo->port_idx & (1 << portid))
 		{
 			td[tinfo->type] = tinfo->id ;
 			*flags |= (1 << tinfo->type);

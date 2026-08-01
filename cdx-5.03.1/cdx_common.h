@@ -282,8 +282,10 @@ struct dpa_l3hdr_info {
 
 //max FMAN instances in this SOC
 #define MAX_FRAME_MANAGERS	2
-/* Kept in step with CDX_CTRL_MAX_PORTS_PER_FMAN (cdx_ioctl.h). */
-#define MAX_PORTS_PER_FMAN	6
+/* Kept in step with CDX_CTRL_MAX_PORTS_PER_FMAN (cdx_ioctl.h). Vendor left
+ * this at 5 with no live reference -- the sole user is a commented-out
+ * declaration in cdx_dpa.c -- so the value is dead either way. */
+#define MAX_PORTS_PER_FMAN	16
 #define MAX_OF_PORTS        4
 
 

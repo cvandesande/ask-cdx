@@ -478,6 +478,24 @@ int dpa_add_oh_if(char *name)
 		DPA_ERROR("%s::invalid name %s\n", __FUNCTION__, name);
 		return FAILURE;
 	}
+	/*
+	 * Both indices come from cdx_cfg.xml by way of dpa_app, which formats
+	 * the name as "dpa-fman%d-oh@%d" with the OFFLINE port's number + 1
+	 * (dpa.c). CDX subtracts that 1 back off below, so the OH array index
+	 * is the configured number verbatim. Nothing validated it before
+	 * cdxdrv_create_of_fqs() indexed
+	 *	offline_port_info[fman_idx][port_idx]
+	 * which is [MAX_FRAME_MANAGERS][MAX_OF_PORTS] -- an out-of-bounds
+	 * write for number >= MAX_OF_PORTS. port_idx == 0 is rejected too:
+	 * port_idx - 1 is unsigned and would wrap, and the sprintf() below
+	 * would then overrun oh_iface_name[8].
+	 */
+	if (fman_idx >= MAX_FRAME_MANAGERS ||
+	    port_idx < 1 || (port_idx - 1) >= MAX_OF_PORTS) {
+		DPA_ERROR("%s::port out of range %s (fman %u, oh %u)\n",
+				__FUNCTION__, name, fman_idx, port_idx);
+		return FAILURE;
+	}
 	strncpy(&info.port_name[0], name, IF_NAME_SIZE);
 	info.port_name[IF_NAME_SIZE - 1] = '\0';
 

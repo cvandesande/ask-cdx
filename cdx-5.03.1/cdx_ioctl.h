@@ -26,13 +26,20 @@
 
 #define CDX_CTRL_MAX_FMANS		2
 /*
- * Soft ceiling on <port> entries per <engine> in cdx_cfg.xml, OFFLINE ports
- * included -- dpa_app passes the raw fmc port_count as finfo->max_ports, and
- * get_port_info() kcalloc()s from it, so this is a sanity bound and not a
- * hardware or array limit. Raised 5 -> 6 so the Mono Gateway DK can run
- * 3x1G + 2x10G alongside the IPsec OFFLINE port (dpa-fman0-oh@2).
+ * Ceiling on <port> entries per <engine> in cdx_cfg.xml, OFFLINE ports
+ * included. dpa_app passes the raw fmc port_count as finfo->max_ports and
+ * get_port_info() kcalloc()s from it, so this exists to bound a
+ * userspace-supplied allocation size -- it is not a hardware or array limit.
+ *
+ * Derived, not chosen: port_count indexes fmc's fman[].ports[], declared as
+ * ports[FMC_PORTS_PER_FMAN] with FMC_PORTS_PER_FMAN == 16 (fmc.h). A larger
+ * value cannot come from a working dpa_app, so 16 is the tightest bound that
+ * is correct for every SoC this header covers (MAX_FRAME_MANAGERS == 2, so
+ * multi-FMan parts are in scope and an LS1046-specific number would not
+ * travel). Real configs stay far below it: 8 MACs + MAX_OF_PORTS OFFLINE
+ * ports is the most this family can present.
  */
-#define CDX_CTRL_MAX_PORTS_PER_FMAN	6
+#define CDX_CTRL_MAX_PORTS_PER_FMAN	16
 #define CDX_CTRL_MAX_TABLES_PER_FMAN	64
 
 //table create ioctl
