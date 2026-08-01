@@ -200,6 +200,24 @@ int  get_tableInfo_by_portid( int fm_index, int portid,  void **td,  int * flags
 		 */
 		if (tinfo->port_idx & (1 << portid))
 		{
+			/*
+			 * type comes straight from get_cctbl_info()'s
+			 * copy_from_user() with no validation, and td is
+			 * void *[MAX_MATCH_TABLES]. An unknown table type in
+			 * the PCD would write past it and corrupt whatever
+			 * follows the caller's array. Bound it, as the sibling
+			 * lookup in dpa_ipsec.c already does.
+			 */
+			if (tinfo->type >= MAX_MATCH_TABLES) {
+				DPA_ERROR("%s::port %d table %s type %u >= "
+						"MAX_MATCH_TABLES %u, skipped\n",
+						__FUNCTION__, portid,
+						tinfo->name,
+						(uint32_t)tinfo->type,
+						(uint32_t)MAX_MATCH_TABLES);
+				tinfo++;
+				continue;
+			}
 			td[tinfo->type] = tinfo->id ;
 			*flags |= (1 << tinfo->type);
 		}

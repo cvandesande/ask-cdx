@@ -40,7 +40,23 @@
  * ports is the most this family can present.
  */
 #define CDX_CTRL_MAX_PORTS_PER_FMAN	16
-#define CDX_CTRL_MAX_TABLES_PER_FMAN	64
+/*
+ * Ceiling on classifier tables, same shape as the port ceiling above: dpa_app
+ * sets finfo->num_tables and get_cctbl_info() kcalloc()s from it, so this
+ * bounds a userspace-supplied allocation size. No array is sized by it.
+ *
+ * Derived, not chosen: dpa_app's get_table_info() sets num_tables to
+ * (cmodel.ccnode_count + cmodel.htnode_count), and both index arrays declared
+ * [FMC_CC_NODES_NUM] with FMC_CC_NODES_NUM == 512 (fmc.h), so 1024 is the
+ * tightest bound a working dpa_app cannot exceed.
+ *
+ * The vendor's 64 was sized for the old 5-port ceiling: the fmc model expands
+ * the PCD per port, so tables scale with port count. Five ports produced 60
+ * and fit; adding the IPsec OFFLINE port made it 72 and set_dpa_params
+ * rejected the whole config. Sixteen ports at that ratio is 192, still far
+ * below 1024.
+ */
+#define CDX_CTRL_MAX_TABLES_PER_FMAN	1024
 
 //table create ioctl
 #define CDX_CTRL_TBL_NAME_LEN	64
